@@ -23,6 +23,7 @@ openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 class AuditRequest(BaseModel):
     brand: str
     competitors: list[str] = []
+    description: str = ""
 
 async def ask_gemini(prompt: str) -> str:
     try:
@@ -47,19 +48,23 @@ async def ask_openai(prompt: str) -> str:
         print(f"OpenAI error: {e}")
         return ""
 
-async def enrich_brand(brand: str) -> dict:
-    response = await ask_openai(f"""What is "{brand}"? Answer in JSON format only, no explanation:
+async def enrich_brand(brand: str, description: str = "") -> dict:
+    context = f'Brand: "{brand}"'
+    if description:
+        context += f'\nUser description: "{description}"'
+    response = await ask_openai(f"""{context}
+
+What category/industry is this brand in? Answer in JSON format only:
 {{
   "category": "short category name (e.g. project management software, CRM, note-taking app)",
-  "description": "one sentence what they do",
-  "known": true or false (is this a known brand?)
+  "known": true or false
 }}""")
     try:
         import json
         clean = response.strip().replace("```json", "").replace("```", "").strip()
         return json.loads(clean)
     except:
-        return {"category": brand + " category", "description": "", "known": False}
+        return {"category": description or brand + " category", "known": False}
 
 async def generate_prompts(brand: str, category: str) -> list[str]:
     response = await ask_openai(f"""Generate exactly 5 realistic search prompts that a potential buyer would type into ChatGPT when looking for a product in this category: "{category}".
@@ -68,31 +73,28 @@ Rules:
 - Write prompts as real buyers would ask them
 - Mix awareness, comparison, and decision-intent prompts
 - Do NOT include the brand name "{brand}" in the prompts
-- Return ONLY the 5 prompts, one per line, no numbering, no explanation
-
-Example for "project management software":
-best project management tool for remote teams
-alternatives to Asana for small business
-how to track team tasks in one place
-project management software comparison 2026
-simple tool for managing team workflows""")
+- Return ONLY the 5 prompts, one per line, no numbering, no explanation""")
 
     prompts = [p.strip() for p in response.strip().split("\n") if p.strip()]
     return prompts[:5] if len(prompts) >= 5 else prompts
+
+@app.post("/check-brand")
+async def check_brand(request: dict):
+    brand = request.get("brand", "")
+    info = await enrich_brand(brand)
+    return {"known": info.get("known", False), "category": info.get("category", "")}
 
 @app.post("/audit")
 async def run_audit(request: AuditRequest):
     brand = request.brand
     competitors = request.competitors
+    description = request.description
 
-    # Step 1: Auto-detect brand category
-    brand_info = await enrich_brand(brand)
+    brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
 
-    # Step 2: Generate relevant prompts
     prompts = await generate_prompts(brand, category)
 
-    # Step 3: Run prompts through models
     results = []
     for prompt in prompts:
         gemini_answer = await ask_gemini(prompt)
@@ -117,7 +119,6 @@ async def run_audit(request: AuditRequest):
     total_checks = len(prompts) * 2
     visibility_score = int(total_mentions / total_checks * 100) if total_checks > 0 else 0
 
-    # Step 4: Competitor ranking
     all_brands = [brand] + competitors
     competitor_stats = []
     for b in all_brands:
@@ -138,17 +139,14 @@ async def run_audit(request: AuditRequest):
 
     summary = f"Brand: {brand}, Category: {category}, Score: {visibility_score}%, Competitors: {[s['name'] + ': ' + str(s['mention_rate']) + '%' for s in competitor_stats]}"
 
-    # Step 5: Generate recommendations
     rec_response = await ask_openai(f"""You are an AI visibility consultant.
 Give exactly 3 specific recommendations to improve {brand}'s visibility in AI models.
 Category: {category}
-
 Format each as:
 PRIORITY: [High/Medium/Low]
 ACTION: [specific action]
 WHY: [one sentence]
 EFFORT: [Easy/Medium/Hard]
-
 Data: {summary}""")
 
     for r in results:
