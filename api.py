@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from google import genai
 from openai import AsyncOpenAI
 import os
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -65,9 +64,10 @@ async def run_audit(request: AuditRequest):
     for prompt in prompts:
         gemini_answer = await ask_gemini(prompt)
         openai_answer = await ask_openai(prompt)
-
         results.append({
             "prompt": prompt,
+            "_gemini_raw": gemini_answer,
+            "_chatgpt_raw": openai_answer,
             "gemini": {
                 "mentioned": brand.lower() in gemini_answer.lower(),
                 "competitors_found": [c for c in competitors if c.lower() in gemini_answer.lower()]
@@ -84,26 +84,34 @@ async def run_audit(request: AuditRequest):
     total_checks = len(prompts) * 2
     visibility_score = int(total_mentions / total_checks * 100)
 
-    summary = f"""
-    Brand: {brand}
-    Overall visibility score: {visibility_score}%
-    Gemini score: {gemini_mentions}/{len(prompts)}
-    ChatGPT score: {openai_mentions}/{len(prompts)}
-    Competitors: {competitors}
-    """
+    all_brands = [brand] + competitors
+    competitor_stats = []
+    for b in all_brands:
+        gemini_count = sum(1 for r in results if b.lower() in r["_gemini_raw"].lower())
+        chatgpt_count = sum(1 for r in results if b.lower() in r["_chatgpt_raw"].lower())
+        total = gemini_count + chatgpt_count
+        competitor_stats.append({
+            "name": b,
+            "is_your_brand": b == brand,
+            "gemini_mentions": gemini_count,
+            "chatgpt_mentions": chatgpt_count,
+            "total_mentions": total,
+            "mention_rate": round(total / total_checks * 100, 1)
+        })
+    competitor_stats.sort(key=lambda x: x["total_mentions"], reverse=True)
+    for i, stat in enumerate(competitor_stats):
+        stat["rank"] = i + 1
+
+    summary = f"Brand: {brand}, Score: {visibility_score}%, Competitors: {[s['name'] + ': ' + str(s['mention_rate']) + '%' for s in competitor_stats]}"
 
     rec_response = gemini_client.models.generate_content(
         model="gemini-3.1-flash-lite",
-        contents=f"""You are an AI visibility consultant.
-        Give exactly 3 specific recommendations to improve {brand}'s visibility in AI models.
-        Format each as:
-        PRIORITY: [High/Medium/Low]
-        ACTION: [specific action]
-        WHY: [one sentence]
-        EFFORT: [Easy/Medium/Hard]
-        
-        Data: {summary}"""
+        contents=f"You are an AI visibility consultant. Give exactly 3 specific recommendations to improve {brand}'s visibility in AI models. Format each as: PRIORITY: [High/Medium/Low] ACTION: [specific action] WHY: [one sentence] EFFORT: [Easy/Medium/Hard] Data: {summary}"
     )
+
+    for r in results:
+        r.pop("_gemini_raw", None)
+        r.pop("_chatgpt_raw", None)
 
     return {
         "brand": brand,
@@ -112,6 +120,7 @@ async def run_audit(request: AuditRequest):
         "chatgpt_score": openai_mentions,
         "total_prompts": len(prompts),
         "results": results,
+        "competitor_ranking": competitor_stats,
         "recommendations": rec_response.text,
     }
 
