@@ -90,7 +90,7 @@ Rules:
 - Focus on DECISION-INTENT: "best X for Y", "X alternatives", "which X should I use"
 - Do NOT include the brand name "{brand}" in the prompts
 - Return ONLY the 10 prompts, one per line, no numbering, no explanation""")
-    prompts = [p.strip() for p in response.strip().split("\n") if p.strip()]
+    prompts = [p.strip().capitalize() for p in response.strip().split("\n") if p.strip()]
     return prompts[:10] if len(prompts) >= 10 else prompts
 
 @app.post("/check-brand")
