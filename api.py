@@ -46,15 +46,19 @@ def extract_domain(url: str) -> str:
         return url
 
 async def ask_gemini(prompt: str) -> str:
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=prompt
-        )
-        return response.text
-    except Exception as e:
-        print(f"Gemini error: {e}")
-        return ""
+    import asyncio
+    for attempt in range(3):
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            print(f"Gemini error (attempt {attempt+1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(3)
+    return ""
 
 async def ask_openai(prompt: str) -> str:
     try:
