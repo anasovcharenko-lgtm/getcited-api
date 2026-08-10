@@ -90,9 +90,8 @@ async def ask_gemini(prompt: str) -> str:
 async def ask_openai(prompt: str) -> str:
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1000
+            model="gpt-4o-search-preview",
+            messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
     except Exception as e:
