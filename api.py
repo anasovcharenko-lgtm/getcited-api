@@ -186,11 +186,11 @@ async def run_audit(request: AuditRequest):
             "_gemini_raw": gemini_answer,
             "_chatgpt_raw": openai_answer,
             "gemini": {
-                "mentioned": clean_brand.lower() in gemini_answer.lower(),
+                "mentioned": (" " + clean_brand.lower() + " ") in (" " + gemini_answer.lower() + " ") or (clean_brand.lower() + ".") in gemini_answer.lower(),
                 "competitors_found": [c for c in competitors if c.lower() in gemini_answer.lower()]
             },
             "chatgpt": {
-                "mentioned": clean_brand.lower() in openai_answer.lower(),
+                "mentioned": (" " + clean_brand.lower() + " ") in (" " + openai_answer.lower() + " ") or (clean_brand.lower() + ".") in openai_answer.lower(),
                 "competitors_found": [c for c in competitors if c.lower() in openai_answer.lower()]
             },
         })
