@@ -116,9 +116,94 @@ async def run_audit(request: AuditRequest):
     results = []
     all_urls = {}
 
+  cat > /tmp/speedup.js << 'EOF'
+const fs = require('fs');
+let code = fs.readFileSync('api.py', 'utf8');
+code = code.replace(
+`    results = []
+    all_urls = {}
+
     for prompt in prompts:
         gemini_answer = await ask_gemini(prompt)
         openai_answer = await ask_openai(prompt)
+
+        for url in extract_urls(gemini_answer):
+            domain = extract_domain(url)
+            if domain not in all_urls:
+                all_urls[domain] = {"url": url, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0}
+            all_urls[domain]["gemini_count"] += 1
+            all_urls[domain]["total"] += 1
+
+        for url in extract_urls(openai_answer):
+            domain = extract_domain(url)
+            if domain not in all_urls:
+                all_urls[domain] = {"url": url, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0}
+            all_urls[domain]["chatgpt_count"] += 1
+            all_urls[domain]["total"] += 1
+
+        results.append({
+            "prompt": prompt,
+            "_gemini_raw": gemini_answer,
+            "_chatgpt_raw": openai_answer,
+            "gemini": {
+                "mentioned": brand.lower() in gemini_answer.lower(),
+                "competitors_found": [c for c in competitors if c.lower() in gemini_answer.lower()]
+            },
+            "chatgpt": {
+                "mentioned": brand.lower() in openai_answer.lower(),
+                "competitors_found": [c for c in competitors if c.lower() in openai_answer.lower()]
+            },
+        })`,
+`    import asyncio
+
+    async def run_prompt(prompt):
+        gemini_answer, openai_answer = await asyncio.gather(
+            ask_gemini(prompt),
+            ask_openai(prompt)
+        )
+        return prompt, gemini_answer, openai_answer
+
+    prompt_results = await asyncio.gather(*[run_prompt(p) for p in prompts])
+
+    results = []
+    all_urls = {}
+
+    for prompt, gemini_answer, openai_answer in prompt_results:
+        for url in extract_urls(gemini_answer):
+            domain = extract_domain(url)
+            if domain not in all_urls:
+                all_urls[domain] = {"url": url, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0}
+            all_urls[domain]["gemini_count"] += 1
+            all_urls[domain]["total"] += 1
+
+        for url in extract_urls(openai_answer):
+            domain = extract_domain(url)
+            if domain not in all_urls:
+                all_urls[domain] = {"url": url, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0}
+            all_urls[domain]["chatgpt_count"] += 1
+            all_urls[domain]["total"] += 1
+
+        results.append({
+            "prompt": prompt,
+            "_gemini_raw": gemini_answer,
+            "_chatgpt_raw": openai_answer,
+            "gemini": {
+                "mentioned": brand.lower() in gemini_answer.lower(),
+                "competitors_found": [c for c in competitors if c.lower() in gemini_answer.lower()]
+            },
+            "chatgpt": {
+                "mentioned": brand.lower() in openai_answer.lower(),
+                "competitors_found": [c for c in competitors if c.lower() in openai_answer.lower()]
+            },
+        })`
+);
+fs.writeFileSync('api.py', code);
+console.log('done');
+EOF
+node /tmp/speedup.js
+git add api.py
+git commit -m "parallelize prompts for faster audit"
+git push origin main
 
         for url in extract_urls(gemini_answer):
             domain = extract_domain(url)
