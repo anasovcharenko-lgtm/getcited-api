@@ -52,7 +52,7 @@ def extract_brand_from_url(url: str) -> str:
     domain = re.sub(r'^www\.', '', domain)
     parts = domain.split('.')
     name = parts[0]
-    for prefix in ['try', 'get', 'use', 'app', 'my']:
+    for prefix in ['try', 'use', 'app', 'my']:
         if name.lower().startswith(prefix) and len(name) > len(prefix) + 2:
             name = name[len(prefix):]
             break
