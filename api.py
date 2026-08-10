@@ -104,26 +104,17 @@ async def enrich_brand(brand: str, description: str = "") -> dict:
     if brand.startswith('http'):
         clean_brand = extract_brand_from_url(brand)
 
-    site_context = ""
-    if brand.startswith('http'):
-        site_context = await get_site_context(brand)
-
-    context = "Brand: " + clean_brand
-    if brand.startswith('http'):
-        context += "\nWebsite URL: " + brand
-    if site_context:
-        context += "\nWebsite content: " + site_context
     if description:
-        context += "\nUser description: " + description
+        context = "Brand: " + clean_brand + "\nDescription: " + description
+    elif brand.startswith('http'):
+        context = "What company or product is at this website: " + brand + "\nBrand name extracted: " + clean_brand + "\n\nSearch your knowledge to identify what this company does. What is their specific product category?"
+    else:
+        context = "Brand: " + clean_brand
 
     response = await ask_openai(context + """
 
-What is this brand and what specific category is it in?
-Use the website content to identify the correct product/service category.
-Be specific - not just "software" but "AI visibility tracking tool" or "project management software".
-
-Answer in JSON format only:
-{"category": "specific category name", "known": true, "clean_name": "common brand name"}""")
+Answer in JSON format only - be very specific about the category:
+{"category": "specific category (e.g. AI brand visibility tracking, project management software, email marketing platform)", "known": true or false, "clean_name": "the brand name as commonly known"}""")
 
     try:
         import json
