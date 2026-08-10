@@ -85,10 +85,16 @@ async def enrich_brand(brand: str, description: str = "") -> dict:
         clean_brand = clean_brand.capitalize()
 
     context = f'Brand: "{clean_brand}"'
+    if brand.startswith('http'):
+        context += f'\nWebsite URL: "{brand}"'
     if description:
         context += f'\nUser description: "{description}"'
     response = await ask_openai(f"""{context}
-What category/industry is this brand in? Be specific - not just "software" but "AI visibility tracking tool" or "project management software for remote teams".
+
+What is this brand and what category/industry is it in?
+Important: use the website URL and full context to identify the correct brand and category.
+Be specific - not just "software" but "AI visibility tracking tool" or "project management software".
+
 Answer in JSON format only:
 {{"category": "specific category name", "known": true or false, "clean_name": "the common brand name people use"}}""")
     try:
