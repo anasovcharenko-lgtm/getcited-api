@@ -70,27 +70,60 @@ async def ask_openai(prompt: str) -> str:
         return ""
 
 async def enrich_brand(brand: str, description: str = "") -> dict:
-    context = f'Brand: "{brand}"'
+    clean_brand = brand
+    if brand.startswith('http'):
+        import re
+        domain = re.sub(r'https?://', '', brand)
+        domain = domain.split('/')[0]
+        domain = re.sub(r'^www\.', '', domain)
+        parts = domain.split('.')
+        clean_brand = parts[0]
+        for prefix in ['try', 'get', 'use', 'app', 'my']:
+            if clean_brand.startswith(prefix) and len(clean_brand) > len(prefix) + 2:
+                clean_brand = clean_brand[len(prefix):]
+                break
+        clean_brand = clean_brand.capitalize()
+
+    context = f'Brand: "{clean_brand}"'
     if description:
         context += f'\nUser description: "{description}"'
     response = await ask_openai(f"""{context}
-What category/industry is this brand in? Answer in JSON format only:
-{{"category": "short category name", "known": true or false}}""")
+What category/industry is this brand in? Be specific - not just "software" but "AI visibility tracking tool" or "project management software for remote teams".
+Answer in JSON format only:
+{{"category": "specific category name", "known": true or false, "clean_name": "the common brand name people use"}}""")
     try:
         import json
         clean = response.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
+        data = json.loads(clean)
+        data['original_brand'] = brand
+        data['clean_brand'] = data.get('clean_name', clean_brand)
+        return data
     except Exception:
-        return {"category": description or brand + " category", "known": False}
+        return {"category": description or clean_brand + " category", "known": False, "original_brand": brand, "clean_brand": clean_brand}
 
 async def generate_prompts(brand: str, category: str) -> list[str]:
-    response = await ask_openai(f"""Generate exactly 10 realistic search prompts that a potential buyer would type into ChatGPT when looking for a product in this category: "{category}".
+    response = await ask_openai(f"""You are helping audit brand visibility in AI search results.
+
+Generate exactly 10 realistic prompts that someone would type into ChatGPT or Google when SEARCHING FOR or COMPARING tools in this category: "{category}".
+
 Rules:
-- Write prompts as real buyers would ask them
-- Mix awareness, comparison, and decision-intent prompts
-- Focus on DECISION-INTENT: "best X for Y", "X alternatives", "which X should I use"
-- Do NOT include the brand name "{brand}" in the prompts
-- Return ONLY the 10 prompts, one per line, no numbering, no explanation""")
+- These are BUYER prompts - people who want to find or compare tools
+- Mix: "best X for Y", "X vs Y", "alternatives to [competitor]", "how to track X", "which tool for X"
+- Be SPECIFIC to the category - not generic marketing questions
+- Do NOT include "{brand}" in the prompts
+- Return ONLY the 10 prompts, one per line, no numbering, no explanation, no quotes
+
+Example for "AI visibility tracking tool":
+Best tool to track brand mentions in ChatGPT
+How to monitor if AI recommends my brand
+AI search visibility software comparison
+Track brand visibility across multiple AI models
+Alternatives to Profound for AI brand monitoring
+How often does ChatGPT mention my company
+Best GEO monitoring tool for marketers
+Which software tracks brand recommendations in AI
+AI overview tracking for marketing teams
+Monitor brand citations in generative AI""")
     prompts = [p.strip().capitalize() for p in response.strip().split("\n") if p.strip()]
     return prompts[:10] if len(prompts) >= 10 else prompts
 
@@ -108,7 +141,8 @@ async def run_audit(request: AuditRequest):
 
     brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
-    prompts = await generate_prompts(brand, category)
+    clean_brand = brand_info.get("clean_brand", brand)
+    prompts = await generate_prompts(clean_brand, category)
 
     async def run_prompt(prompt):
         gemini_answer, openai_answer = await asyncio.gather(
@@ -142,11 +176,11 @@ async def run_audit(request: AuditRequest):
             "_gemini_raw": gemini_answer,
             "_chatgpt_raw": openai_answer,
             "gemini": {
-                "mentioned": brand.lower() in gemini_answer.lower(),
+                "mentioned": clean_brand.lower() in gemini_answer.lower(),
                 "competitors_found": [c for c in competitors if c.lower() in gemini_answer.lower()]
             },
             "chatgpt": {
-                "mentioned": brand.lower() in openai_answer.lower(),
+                "mentioned": clean_brand.lower() in openai_answer.lower(),
                 "competitors_found": [c for c in competitors if c.lower() in openai_answer.lower()]
             },
         })
@@ -156,13 +190,24 @@ async def run_audit(request: AuditRequest):
     total_checks = len(prompts) * 2
     visibility_score = int((gemini_mentions + openai_mentions) / total_checks * 100) if total_checks > 0 else 0
 
-    all_brands = [brand] + competitors
+    all_brands = [clean_brand] + competitors
     competitor_stats = []
     for b in all_brands:
-        g = sum(1 for r in results if b.lower() in r["_gemini_raw"].lower())
-        c = sum(1 for r in results if b.lower() in r["_chatgpt_raw"].lower())
+        search_b = b
+        if b.startswith('http'):
+            import re
+            d = re.sub(r'https?://', '', b).split('/')[0]
+            d = re.sub(r'^www\.', '', d)
+            parts = d.split('.')
+            search_b = parts[0].capitalize()
+            for prefix in ['try', 'get', 'use', 'app', 'my']:
+                if search_b.lower().startswith(prefix) and len(search_b) > len(prefix) + 2:
+                    search_b = search_b[len(prefix):].capitalize()
+                    break
+        g = sum(1 for r in results if search_b.lower() in r["_gemini_raw"].lower())
+        c = sum(1 for r in results if search_b.lower() in r["_chatgpt_raw"].lower())
         competitor_stats.append({
-            "name": b, "is_your_brand": b == brand,
+            "name": search_b if b.startswith('http') else b, "is_your_brand": b == clean_brand or b == brand,
             "gemini_mentions": g, "chatgpt_mentions": c,
             "total_mentions": g + c,
             "mention_rate": round((g + c) / total_checks * 100, 1) if total_checks > 0 else 0
@@ -172,7 +217,7 @@ async def run_audit(request: AuditRequest):
         stat["rank"] = i + 1
 
     citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:10]
-    summary = f"Brand: {brand}, Category: {category}, Score: {visibility_score}%"
+    summary = f"Brand: {clean_brand}, Category: {category}, Score: {visibility_score}%"
 
     rec_response = await ask_openai(f"""You are an AI visibility consultant.
 Give exactly 3 specific recommendations to improve {brand}'s visibility in AI models.
@@ -189,7 +234,7 @@ Data: {summary}""")
         r.pop("_chatgpt_raw", None)
 
     return {
-        "brand": brand,
+        "brand": clean_brand,
         "category": category,
         "visibility_score": visibility_score,
         "gemini_score": gemini_mentions,
