@@ -69,6 +69,26 @@ async def ask_openai(prompt: str) -> str:
         print(f"OpenAI error: {e}")
         return ""
 
+
+async def get_site_context(url: str) -> str:
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            text = resp.text[:3000]
+            import re
+            title = re.search(r'<title[^>]*>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
+            desc = re.search(r'<meta[^>]*name=["']description["'][^>]*content=["'](.*?)["']', text, re.IGNORECASE)
+            og_desc = re.search(r'<meta[^>]*property=["']og:description["'][^>]*content=["'](.*?)["']', text, re.IGNORECASE)
+            result = []
+            if title: result.append(f"Title: {title.group(1).strip()}")
+            if desc: result.append(f"Description: {desc.group(1).strip()}")
+            elif og_desc: result.append(f"Description: {og_desc.group(1).strip()}")
+            return " | ".join(result)
+    except Exception as e:
+        print(f"Scrape error: {e}")
+        return ""
+
 async def enrich_brand(brand: str, description: str = "") -> dict:
     clean_brand = brand
     if brand.startswith('http'):
@@ -84,9 +104,14 @@ async def enrich_brand(brand: str, description: str = "") -> dict:
                 break
         clean_brand = clean_brand.capitalize()
 
+    site_context = ""
+    if brand.startswith('http'):
+        site_context = await get_site_context(brand)
     context = f'Brand: "{clean_brand}"'
     if brand.startswith('http'):
         context += f'\nWebsite URL: "{brand}"'
+    if site_context:
+        context += f'\nWebsite content: "{site_context}"'
     if description:
         context += f'\nUser description: "{description}"'
     response = await ask_openai(f"""{context}
