@@ -82,9 +82,11 @@ async def ask_gemini(prompt: str) -> str:
             model="gemini-3.1-flash-lite",
             contents=prompt
         )
+        print(f"Gemini OK: {len(response.text)} chars")
         return response.text
     except Exception as e:
         print(f"Gemini error: {e}")
+        return "GEMINI_BLOCKED"
         return ""
 
 async def ask_openai(prompt: str) -> str:
