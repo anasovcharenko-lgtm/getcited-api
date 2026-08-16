@@ -79,8 +79,9 @@ async def get_site_context(url: str) -> str:
 async def ask_gemini(prompt: str) -> str:
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=prompt
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config={"tools": [{"google_search": {}}]}
         )
         print(f"Gemini OK: {len(response.text)} chars, brand check: {clean_brand.lower() in response.text.lower()}")
         return response.text
