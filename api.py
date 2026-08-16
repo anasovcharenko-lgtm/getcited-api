@@ -82,7 +82,7 @@ async def ask_gemini(prompt: str) -> str:
             model="gemini-3.1-flash-lite",
             contents=prompt
         )
-        print(f"Gemini OK: {len(response.text)} chars")
+        print(f"Gemini OK: {len(response.text)} chars, brand check: {clean_brand.lower() in response.text.lower()}")
         return response.text
     except Exception as e:
         print(f"Gemini error: {e}")
