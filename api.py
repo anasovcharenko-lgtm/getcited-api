@@ -79,7 +79,7 @@ async def get_site_context(url: str) -> str:
 async def ask_gemini(prompt: str) -> str:
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-3.1-flash-lite",
             contents=prompt,
             config={"tools": [{"google_search": {}}]}
         )
