@@ -26,6 +26,7 @@ class AuditRequest(BaseModel):
     brand: str
     competitors: list[str] = []
     description: str = ""
+    website: str = ""
 
 def extract_urls(text: str) -> list[str]:
     pattern = r'https?://[^\s\)\]\,\"\'<>]+'
@@ -57,6 +58,33 @@ def extract_brand_from_url(url: str) -> str:
             name = name[len(prefix):]
             break
     return name.capitalize()
+
+def name_to_slug(name: str) -> str:
+    """Best-effort slug for matching a brand/competitor name against a domain
+    when we don't have their real website (e.g. 'Notion HQ' -> 'notionhq')."""
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+def url_matches_name(url: str, domain_hint: str, name: str) -> bool:
+    """True if url's domain is (or looks like) the given site.
+    domain_hint: a known domain (from a real website URL), checked first — reliable.
+    name: fallback slug match against the domain — best-effort, used only if no domain_hint."""
+    domain = extract_domain(url).lower()
+    if domain_hint:
+        domain_hint = domain_hint.lower().lstrip('www.')
+        return domain == domain_hint or domain.endswith('.' + domain_hint) or domain_hint.endswith('.' + domain)
+    slug = name_to_slug(name)
+    return bool(slug) and slug in re.sub(r'[^a-z0-9]', '', domain)
+
+def find_mention_sentence(text: str, brand: str) -> str:
+    """Grab one short sentence/clause mentioning the brand, for a 'what AI says' preview."""
+    if not text:
+        return ""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    for s in sentences:
+        if brand.lower() in s.lower():
+            s = s.strip()
+            return s if len(s) <= 240 else s[:237] + "..."
+    return ""
 
 async def get_site_context(url: str) -> str:
     try:
@@ -151,11 +179,24 @@ async def run_audit(request: AuditRequest):
     brand = request.brand
     competitors = request.competitors
     description = request.description
+    website = request.website.strip()
 
     brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
     clean_brand = brand_info.get("clean_brand", brand)
     prompts = await generate_prompts(clean_brand, category)
+
+    # Figure out the brand's own domain if we can — this is what lets us tell
+    # "mentioned with a link to your site" (mention) apart from "named with no
+    # link" (citation). Prefer an explicit website; fall back to the brand
+    # input if it was a URL; otherwise we simply won't have a reliable domain
+    # and mentions_with_link will be 0 for this brand until one is provided.
+    if website:
+        brand_domain = extract_domain(website if website.startswith('http') else 'https://' + website)
+    elif brand.startswith('http'):
+        brand_domain = extract_domain(brand)
+    else:
+        brand_domain = ""
 
     async def run_prompt(prompt):
         gemini_answer, openai_answer = await asyncio.gather(
@@ -168,33 +209,78 @@ async def run_audit(request: AuditRequest):
 
     results = []
     all_urls = {}
+    sample_quote = ""
+
+    def process_model(prompt, answer, competitors):
+        nonlocal all_urls
+        answer_lower = answer.lower()
+        name_mentioned = (" " + clean_brand.lower() + " ") in (" " + answer_lower + " ") or (clean_brand.lower() + ".") in answer_lower
+        urls = extract_urls(answer)
+        has_own_link = any(url_matches_name(u, brand_domain, clean_brand) for u in urls)
+
+        competitors_with_link = []
+        competitors_without_link = []
+        for c in competitors:
+            if c.lower() not in answer_lower:
+                continue
+            if any(url_matches_name(u, "", c) for u in urls):
+                competitors_with_link.append(c)
+            else:
+                competitors_without_link.append(c)
+
+        for u in urls:
+            domain = extract_domain(u)
+            if domain not in all_urls:
+                all_urls[domain] = {"url": u, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0, "prompt": prompt}
+
+        return {
+            "name_mentioned": name_mentioned,
+            "has_own_link": has_own_link,
+            "urls": urls,
+            "competitors_with_link": competitors_with_link,
+            "competitors_without_link": competitors_without_link,
+        }
 
     for prompt, gemini_answer, openai_answer in prompt_results:
-        for url in extract_urls(gemini_answer):
-            domain = extract_domain(url)
-            if domain not in all_urls:
-                all_urls[domain] = {"url": url, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0}
+        g = process_model(prompt, gemini_answer, competitors)
+        o = process_model(prompt, openai_answer, competitors)
+
+        for u in g["urls"]:
+            domain = extract_domain(u)
             all_urls[domain]["gemini_count"] += 1
             all_urls[domain]["total"] += 1
-
-        for url in extract_urls(openai_answer):
-            domain = extract_domain(url)
-            if domain not in all_urls:
-                all_urls[domain] = {"url": url, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0}
+        for u in o["urls"]:
+            domain = extract_domain(u)
             all_urls[domain]["chatgpt_count"] += 1
             all_urls[domain]["total"] += 1
+
+        g_mentioned = g["name_mentioned"]
+        o_mentioned = o["name_mentioned"]
+        g_with_link = g_mentioned and g["has_own_link"]
+        o_with_link = o_mentioned and o["has_own_link"]
+
+        if not sample_quote and (g_mentioned or o_mentioned):
+            sample_quote = find_mention_sentence(gemini_answer, clean_brand) or find_mention_sentence(openai_answer, clean_brand)
 
         results.append({
             "prompt": prompt,
             "_gemini_raw": gemini_answer,
             "_chatgpt_raw": openai_answer,
             "gemini": {
-                "mentioned": (" " + clean_brand.lower() + " ") in (" " + gemini_answer.lower() + " ") or (clean_brand.lower() + ".") in gemini_answer.lower(),
-                "competitors_found": [c for c in competitors if c.lower() in gemini_answer.lower()]
+                "mentioned": g_mentioned,
+                "mentioned_with_link": g_with_link,
+                "mentioned_without_link": g_mentioned and not g_with_link,
+                "competitors_found": list(set(g["competitors_with_link"] + g["competitors_without_link"])),
+                "competitors_with_link": g["competitors_with_link"],
+                "competitors_without_link": g["competitors_without_link"],
             },
             "chatgpt": {
-                "mentioned": (" " + clean_brand.lower() + " ") in (" " + openai_answer.lower() + " ") or (clean_brand.lower() + ".") in openai_answer.lower(),
-                "competitors_found": [c for c in competitors if c.lower() in openai_answer.lower()]
+                "mentioned": o_mentioned,
+                "mentioned_with_link": o_with_link,
+                "mentioned_without_link": o_mentioned and not o_with_link,
+                "competitors_found": list(set(o["competitors_with_link"] + o["competitors_without_link"])),
+                "competitors_with_link": o["competitors_with_link"],
+                "competitors_without_link": o["competitors_without_link"],
             },
         })
 
@@ -202,6 +288,9 @@ async def run_audit(request: AuditRequest):
     openai_mentions = sum(1 for r in results if r["chatgpt"]["mentioned"])
     total_checks = len(prompts) * 2
     visibility_score = int((gemini_mentions + openai_mentions) / total_checks * 100) if total_checks > 0 else 0
+
+    mentions_with_link_count = sum(1 for r in results for m in ("gemini", "chatgpt") if r[m]["mentioned_with_link"])
+    mentions_without_link_count = sum(1 for r in results for m in ("gemini", "chatgpt") if r[m]["mentioned_without_link"])
 
     def get_search_name(b):
         if b.startswith('http'):
@@ -212,15 +301,24 @@ async def run_audit(request: AuditRequest):
     competitor_stats = []
     for b in all_brands:
         search_b = get_search_name(b)
+        is_you = b == brand or b == clean_brand
         g = sum(1 for r in results if search_b.lower() in r["_gemini_raw"].lower())
         c = sum(1 for r in results if search_b.lower() in r["_chatgpt_raw"].lower())
+        if is_you:
+            with_link = mentions_with_link_count
+            without_link = mentions_without_link_count
+        else:
+            with_link = sum(1 for r in results for m in ("gemini", "chatgpt") if search_b in r[m]["competitors_with_link"])
+            without_link = sum(1 for r in results for m in ("gemini", "chatgpt") if search_b in r[m]["competitors_without_link"])
         competitor_stats.append({
             "name": search_b,
-            "is_your_brand": b == brand or b == clean_brand,
+            "is_your_brand": is_you,
             "gemini_mentions": g,
             "chatgpt_mentions": c,
             "total_mentions": g + c,
-            "mention_rate": round((g + c) / total_checks * 100, 1) if total_checks > 0 else 0
+            "mention_rate": round((g + c) / total_checks * 100, 1) if total_checks > 0 else 0,
+            "mentions_with_link": with_link,
+            "mentions_without_link": without_link,
         })
     competitor_stats.sort(key=lambda x: x["total_mentions"], reverse=True)
     for i, stat in enumerate(competitor_stats):
@@ -243,13 +341,17 @@ Data: """ + summary)
     return {
         "brand": clean_brand,
         "category": category,
+        "brand_domain": brand_domain,
         "visibility_score": visibility_score,
         "gemini_score": gemini_mentions,
         "chatgpt_score": openai_mentions,
         "total_prompts": len(prompts),
+        "mentions_score": mentions_with_link_count,
+        "citations_score": mentions_without_link_count,
         "results": results,
         "competitor_ranking": competitor_stats,
         "citations": citations,
+        "sample_quote": sample_quote,
         "recommendations": rec_response,
     }
 
