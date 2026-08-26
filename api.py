@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 import os
 import re
 import asyncio
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -75,6 +76,26 @@ def url_matches_name(url: str, domain_hint: str, name: str) -> bool:
     slug = name_to_slug(name)
     return bool(slug) and slug in re.sub(r'[^a-z0-9]', '', domain)
 
+def trim_answer(text: str, limit: int = 1800) -> str:
+    """Keep the real AI answer for display, but cap it so a 10-prompt audit
+    doesn't balloon the response payload."""
+    if not text:
+        return ""
+    # Drop the "Sources: ..." block we append internally — the URLs are already
+    # surfaced separately as cited_domains, and they read as noise in the answer.
+    text = re.split(r'\n\nSources: ', text)[0].strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+def unique_domains(urls: list[str]) -> list[str]:
+    seen = []
+    for u in urls:
+        d = extract_domain(u)
+        if d and d not in seen:
+            seen.append(d)
+    return seen[:6]
+
 def find_mention_sentence(text: str, brand: str) -> str:
     """Grab one short sentence/clause mentioning the brand, for a 'what AI says' preview."""
     if not text:
@@ -106,6 +127,9 @@ async def get_site_context(url: str) -> str:
 
 MODEL_ERRORS: dict[str, str] = {}
 
+# gpt-4o-search-preview was shut down on 2026-07-23. Web search now runs through
+# the Responses API web_search tool on a standard model. Override with env vars
+# if these names change again.
 OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-5.6")
 OPENAI_SEARCH_FALLBACKS = ["gpt-5.6-terra", "gpt-5.5", "gpt-4.1"]
 OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-terra")
@@ -127,6 +151,9 @@ async def ask_gemini(prompt: str) -> str:
         return ""
 
 def _collect_response_urls(response) -> list[str]:
+    """Pull cited URLs out of a Responses API result. These annotations are far
+    more reliable than regexing URLs out of prose, and they include sources the
+    model consulted but didn't render as a visible link."""
     urls: list[str] = []
     try:
         for item in getattr(response, "output", []) or []:
@@ -140,6 +167,9 @@ def _collect_response_urls(response) -> list[str]:
     return urls
 
 async def ask_openai(prompt: str, use_search: bool = False) -> str:
+    """use_search=True runs the audit prompt with live web search (what a real
+    user's ChatGPT query does). Utility calls (category lookup, prompt
+    generation, recommendations) don't need search, so they skip it."""
     if not use_search:
         try:
             response = await openai_client.responses.create(
@@ -161,6 +191,8 @@ async def ask_openai(prompt: str, use_search: bool = False) -> str:
                 input=prompt,
             )
             text = response.output_text or ""
+            # Append cited URLs so downstream link extraction sees every source,
+            # not just the ones the model happened to inline in the prose.
             urls = _collect_response_urls(response)
             if urls:
                 text += "\n\nSources: " + " ".join(dict.fromkeys(urls))
@@ -226,6 +258,7 @@ async def run_audit(request: AuditRequest):
     competitors = request.competitors
     description = request.description
     website = request.website.strip()
+    MODEL_ERRORS.clear()
 
     brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
@@ -319,6 +352,8 @@ async def run_audit(request: AuditRequest):
                 "competitors_found": list(set(g["competitors_with_link"] + g["competitors_without_link"])),
                 "competitors_with_link": g["competitors_with_link"],
                 "competitors_without_link": g["competitors_without_link"],
+                "answer": trim_answer(gemini_answer),
+                "cited_domains": unique_domains(g["urls"]),
             },
             "chatgpt": {
                 "mentioned": o_mentioned,
@@ -327,6 +362,8 @@ async def run_audit(request: AuditRequest):
                 "competitors_found": list(set(o["competitors_with_link"] + o["competitors_without_link"])),
                 "competitors_with_link": o["competitors_with_link"],
                 "competitors_without_link": o["competitors_without_link"],
+                "answer": trim_answer(openai_answer),
+                "cited_domains": unique_domains(o["urls"]),
             },
         })
 
@@ -388,6 +425,15 @@ Data: """ + summary)
         "brand": clean_brand,
         "category": category,
         "brand_domain": brand_domain,
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "models_used": {
+            "chatgpt": OPENAI_SEARCH_MODEL,
+            "gemini": GEMINI_MODEL,
+        },
+        "model_status": {
+            "gemini": {"ok": "gemini" not in MODEL_ERRORS, "error": MODEL_ERRORS.get("gemini")},
+            "chatgpt": {"ok": "chatgpt" not in MODEL_ERRORS, "error": MODEL_ERRORS.get("chatgpt")},
+        },
         "visibility_score": visibility_score,
         "gemini_score": gemini_mentions,
         "chatgpt_score": openai_mentions,
@@ -403,12 +449,17 @@ Data: """ + summary)
 
 @app.get("/health-models")
 async def health_models():
+    """Quick check of which AI models actually respond. Use this to tell a real
+    'low visibility' result apart from 'the model never answered'."""
     MODEL_ERRORS.clear()
     probe = "What is the best project management software? Name two tools."
-    g, o = await asyncio.gather(ask_gemini(probe), ask_openai(probe, use_search=True))
+    gemini_text, openai_text = await asyncio.gather(
+        ask_gemini(probe),
+        ask_openai(probe, use_search=True),
+    )
     return {
-        "gemini": {"ok": bool(g), "chars": len(g), "model": GEMINI_MODEL, "error": MODEL_ERRORS.get("gemini")},
-        "chatgpt": {"ok": bool(o), "chars": len(o), "model": OPENAI_SEARCH_MODEL, "urls_found": len(extract_urls(o)), "error": MODEL_ERRORS.get("chatgpt")},
+        "gemini": {"ok": bool(gemini_text), "chars": len(gemini_text), "model": GEMINI_MODEL, "error": MODEL_ERRORS.get("gemini")},
+        "chatgpt": {"ok": bool(openai_text), "chars": len(openai_text), "model": OPENAI_SEARCH_MODEL, "urls_found": len(extract_urls(openai_text)), "error": MODEL_ERRORS.get("chatgpt")},
     }
 
 @app.get("/")
