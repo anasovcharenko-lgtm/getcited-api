@@ -130,12 +130,19 @@ MODEL_ERRORS: dict[str, str] = {}
 # gpt-4o-search-preview was shut down on 2026-07-23. Web search now runs through
 # the Responses API web_search tool on a standard model. Override with env vars
 # if these names change again.
-OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-5.6")
-OPENAI_SEARCH_FALLBACKS = ["gpt-5.6-terra", "gpt-5.5", "gpt-4.1"]
-OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-terra")
+OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-5.6-luna")
+OPENAI_SEARCH_FALLBACKS = ["gpt-5.6-terra", "gpt-5.6", "gpt-4.1"]
+OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5-nano")
+OPENAI_UTILITY_FALLBACKS = ["gpt-5.6-luna", "gpt-4.1-mini"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "6"))
+MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "700"))
+GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
 
 async def ask_gemini(prompt: str) -> str:
+    if not GEMINI_ENABLED:
+        MODEL_ERRORS["gemini"] = "disabled"
+        return ""
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
@@ -171,16 +178,21 @@ async def ask_openai(prompt: str, use_search: bool = False) -> str:
     user's ChatGPT query does). Utility calls (category lookup, prompt
     generation, recommendations) don't need search, so they skip it."""
     if not use_search:
-        try:
-            response = await openai_client.responses.create(
-                model=OPENAI_UTILITY_MODEL,
-                input=prompt,
-            )
-            return response.output_text or ""
-        except Exception as e:
-            print(f"OpenAI utility error: {e}")
-            MODEL_ERRORS["chatgpt"] = str(e)[:300]
-            return ""
+        last_error = None
+        for model in [OPENAI_UTILITY_MODEL] + OPENAI_UTILITY_FALLBACKS:
+            try:
+                response = await openai_client.responses.create(
+                    model=model,
+                    input=prompt,
+                    max_output_tokens=MAX_ANSWER_TOKENS,
+                )
+                return response.output_text or ""
+            except Exception as e:
+                last_error = e
+                print(f"OpenAI utility error on {model}: {e}")
+                continue
+        MODEL_ERRORS["chatgpt"] = str(last_error)[:300]
+        return ""
 
     last_error = None
     for model in [OPENAI_SEARCH_MODEL] + OPENAI_SEARCH_FALLBACKS:
@@ -189,6 +201,7 @@ async def ask_openai(prompt: str, use_search: bool = False) -> str:
                 model=model,
                 tools=[{"type": "web_search"}],
                 input=prompt,
+                max_output_tokens=MAX_ANSWER_TOKENS,
             )
             text = response.output_text or ""
             # Append cited URLs so downstream link extraction sees every source,
@@ -234,17 +247,25 @@ Answer in JSON format only - be very specific about the category:
     except Exception:
         return {"category": description or clean_brand + " category", "known": False, "original_brand": brand, "clean_brand": clean_brand}
 
+PROMPT_CACHE: dict[str, list[str]] = {}
+
 async def generate_prompts(brand: str, category: str) -> list[str]:
-    response = await ask_openai("Generate exactly 10 realistic prompts that someone would type into ChatGPT when searching for or comparing tools in this category: " + category + """
+    cache_key = category.strip().lower()
+    if cache_key in PROMPT_CACHE:
+        print(f"Prompt cache hit: {cache_key}")
+        return PROMPT_CACHE[cache_key]
+    response = await ask_openai("Generate exactly " + str(PROMPT_COUNT) + " realistic prompts that someone would type into ChatGPT when searching for or comparing tools in this category: " + category + """
 
 Rules:
 - These are BUYER prompts - people who want to find or compare tools
 - Mix: best X for Y, X vs Y, alternatives to competitor, how to track X, which tool for X
 - Be SPECIFIC to the category
 - Do NOT include the brand name in the prompts
-- Return ONLY the 10 prompts, one per line, no numbering, no explanation""")
-    prompts = [p.strip().capitalize() for p in response.strip().split("\n") if p.strip()]
-    return prompts[:10] if len(prompts) >= 10 else prompts
+- Return ONLY the prompts, one per line, no numbering, no explanation""")
+    prompts = [p.strip().capitalize() for p in response.strip().split("\n") if p.strip()][:PROMPT_COUNT]
+    if prompts:
+        PROMPT_CACHE[cache_key] = prompts
+    return prompts
 
 @app.post("/check-brand")
 async def check_brand(request: dict):
@@ -252,12 +273,22 @@ async def check_brand(request: dict):
     info = await enrich_brand(brand)
     return {"known": info.get("known", False), "category": info.get("category", "")}
 
+AUDIT_CACHE: dict = {}
+AUDIT_CACHE_TTL = int(os.getenv("AUDIT_CACHE_TTL", "3600"))
+
 @app.post("/audit")
 async def run_audit(request: AuditRequest):
     brand = request.brand
     competitors = request.competitors
     description = request.description
     website = request.website.strip()
+
+    cache_key = "|".join([brand.strip().lower(), ",".join(sorted(c.lower() for c in competitors)), website.lower()])
+    cached = AUDIT_CACHE.get(cache_key)
+    if cached and (asyncio.get_event_loop().time() - cached[0]) < AUDIT_CACHE_TTL:
+        print(f"Audit cache hit: {cache_key}")
+        return {**cached[1], "from_cache": True}
+
     MODEL_ERRORS.clear()
 
     brand_info = await enrich_brand(brand, description)
@@ -421,7 +452,7 @@ Data: """ + summary)
         r.pop("_gemini_raw", None)
         r.pop("_chatgpt_raw", None)
 
-    return {
+    payload = {
         "brand": clean_brand,
         "category": category,
         "brand_domain": brand_domain,
@@ -431,7 +462,7 @@ Data: """ + summary)
             "gemini": GEMINI_MODEL,
         },
         "model_status": {
-            "gemini": {"ok": "gemini" not in MODEL_ERRORS, "error": MODEL_ERRORS.get("gemini")},
+            "gemini": {"ok": "gemini" not in MODEL_ERRORS, "enabled": GEMINI_ENABLED, "error": MODEL_ERRORS.get("gemini")},
             "chatgpt": {"ok": "chatgpt" not in MODEL_ERRORS, "error": MODEL_ERRORS.get("chatgpt")},
         },
         "visibility_score": visibility_score,
@@ -446,6 +477,11 @@ Data: """ + summary)
         "sample_quote": sample_quote,
         "recommendations": rec_response,
     }
+
+    if "chatgpt" not in MODEL_ERRORS:
+        AUDIT_CACHE[cache_key] = (asyncio.get_event_loop().time(), payload)
+
+    return payload
 
 @app.get("/health-models")
 async def health_models():
