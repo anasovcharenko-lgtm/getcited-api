@@ -136,7 +136,7 @@ OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5-nano")
 OPENAI_UTILITY_FALLBACKS = ["gpt-5.6-luna", "gpt-4.1-mini"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "6"))
-MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "700"))
+MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
 GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
 
 async def ask_gemini(prompt: str) -> str:
@@ -478,10 +478,46 @@ Data: """ + summary)
         "recommendations": rec_response,
     }
 
-    if "chatgpt" not in MODEL_ERRORS:
+    got_answers = any(r["chatgpt"].get("answer") or r["gemini"].get("answer") for r in results)
+    if "chatgpt" not in MODEL_ERRORS and got_answers:
         AUDIT_CACHE[cache_key] = (asyncio.get_event_loop().time(), payload)
 
     return payload
+
+@app.post("/clear-cache")
+async def clear_cache():
+    n = len(AUDIT_CACHE) + len(PROMPT_CACHE)
+    AUDIT_CACHE.clear()
+    PROMPT_CACHE.clear()
+    return {"cleared": n}
+
+@app.get("/debug-prompt")
+async def debug_prompt(q: str = "best AI visibility tracking tools"):
+    try:
+        response = await openai_client.responses.create(
+            model=OPENAI_SEARCH_MODEL,
+            tools=[{"type": "web_search"}],
+            input=q,
+            max_output_tokens=MAX_ANSWER_TOKENS,
+        )
+        text = response.output_text or ""
+        usage = getattr(response, "usage", None)
+        rt = None
+        if usage is not None:
+            d = getattr(usage, "output_tokens_details", None)
+            rt = getattr(d, "reasoning_tokens", None) if d else None
+        return {
+            "model": OPENAI_SEARCH_MODEL,
+            "max_output_tokens": MAX_ANSWER_TOKENS,
+            "status": getattr(response, "status", None),
+            "incomplete_reason": getattr(getattr(response, "incomplete_details", None), "reason", None),
+            "text_chars": len(text),
+            "text_preview": text[:300],
+            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+            "reasoning_tokens": rt,
+        }
+    except Exception as e:
+        return {"error": str(e)[:500]}
 
 @app.get("/health-models")
 async def health_models():
