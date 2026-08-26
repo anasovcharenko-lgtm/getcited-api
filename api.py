@@ -476,6 +476,15 @@ Data: """ + summary)
         "citations": citations,
         "sample_quote": sample_quote,
         "recommendations": rec_response,
+        "debug": {
+            "category": category,
+            "clean_brand": clean_brand,
+            "prompts_generated": len(prompts),
+            "prompts": prompts,
+            "competitors_in": competitors,
+            "answer_lengths": [len(r["chatgpt"].get("answer") or "") for r in results],
+            "model_errors": dict(MODEL_ERRORS),
+        },
     }
 
     got_answers = any(r["chatgpt"].get("answer") or r["gemini"].get("answer") for r in results)
