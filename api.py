@@ -132,8 +132,8 @@ MODEL_ERRORS: dict[str, str] = {}
 # if these names change again.
 OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-5.6-luna")
 OPENAI_SEARCH_FALLBACKS = ["gpt-5.6-terra", "gpt-5.6", "gpt-4.1"]
-OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5-nano")
-OPENAI_UTILITY_FALLBACKS = ["gpt-5.6-luna", "gpt-4.1-mini"]
+OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-luna")
+OPENAI_UTILITY_FALLBACKS = ["gpt-5-nano", "gpt-4.1-mini"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "6"))
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
@@ -234,8 +234,13 @@ async def enrich_brand(brand: str, description: str = "") -> dict:
 
     response = await ask_openai(context + """
 
-Answer in JSON format only - be very specific about the category:
-{"category": "specific category (e.g. AI brand visibility tracking, project management software, email marketing platform)", "known": true or false, "clean_name": "the brand name as commonly known"}""")
+Identify the exact product category buyers would search for. Be narrow and concrete:
+name the market this product actually competes in, not a broader adjacent one.
+For example "AI search visibility tracking (GEO)" is a different market from
+"social media monitoring" - do not substitute one for the other.
+
+Answer in JSON only, no other text:
+{"category": "narrow buyer-facing category, 2-5 words", "known": true or false, "clean_name": "the brand name as commonly known"}""")
 
     try:
         import json
@@ -248,6 +253,14 @@ Answer in JSON format only - be very specific about the category:
         return {"category": description or clean_brand + " category", "known": False, "original_brand": brand, "clean_brand": clean_brand}
 
 PROMPT_CACHE: dict[str, list[str]] = {}
+
+def _is_junk_prompt(p: str) -> bool:
+    low = p.lower()
+    if re.search(r'\b(x vs\.? y|\[.*?\]|<.*?>|tool a|brand a)\b', low):
+        return True
+    if len(p.split()) > 12 or len(p.split()) < 2:
+        return True
+    return False
 
 async def generate_prompts(brand: str, category: str) -> list[str]:
     cache_key = category.strip().lower()
