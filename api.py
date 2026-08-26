@@ -104,6 +104,8 @@ async def get_site_context(url: str) -> str:
         print(f"Scrape error: {e}")
         return ""
 
+MODEL_ERRORS: dict[str, str] = {}
+
 async def ask_gemini(prompt: str) -> str:
     try:
         response = gemini_client.models.generate_content(
@@ -111,11 +113,12 @@ async def ask_gemini(prompt: str) -> str:
             contents=prompt,
             config={"tools": [{"google_search": {}}]}
         )
-        print(f"Gemini OK: {len(response.text)} chars, brand check: {clean_brand.lower() in response.text.lower()}")
-        return response.text
+        text = response.text or ""
+        print(f"Gemini OK: {len(text)} chars")
+        return text
     except Exception as e:
         print(f"Gemini error: {e}")
-        return "GEMINI_BLOCKED"
+        MODEL_ERRORS["gemini"] = str(e)[:300]
         return ""
 
 async def ask_openai(prompt: str) -> str:
@@ -124,9 +127,12 @@ async def ask_openai(prompt: str) -> str:
             model="gpt-4o-search-preview",
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.choices[0].message.content
+        text = response.choices[0].message.content or ""
+        print(f"OpenAI OK: {len(text)} chars")
+        return text
     except Exception as e:
         print(f"OpenAI error: {e}")
+        MODEL_ERRORS["chatgpt"] = str(e)[:300]
         return ""
 
 async def enrich_brand(brand: str, description: str = "") -> dict:
@@ -353,6 +359,16 @@ Data: """ + summary)
         "citations": citations,
         "sample_quote": sample_quote,
         "recommendations": rec_response,
+    }
+
+@app.get("/health-models")
+async def health_models():
+    MODEL_ERRORS.clear()
+    probe = "Say the single word: pong"
+    g, o = await asyncio.gather(ask_gemini(probe), ask_openai(probe))
+    return {
+        "gemini": {"ok": bool(g), "chars": len(g), "error": MODEL_ERRORS.get("gemini")},
+        "chatgpt": {"ok": bool(o), "chars": len(o), "error": MODEL_ERRORS.get("chatgpt")},
     }
 
 @app.get("/")
