@@ -106,10 +106,15 @@ async def get_site_context(url: str) -> str:
 
 MODEL_ERRORS: dict[str, str] = {}
 
+OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-5.6")
+OPENAI_SEARCH_FALLBACKS = ["gpt-5.6-terra", "gpt-5.5", "gpt-4.1"]
+OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-terra")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+
 async def ask_gemini(prompt: str) -> str:
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.1-flash-lite",
+            model=GEMINI_MODEL,
             contents=prompt,
             config={"tools": [{"google_search": {}}]}
         )
@@ -121,19 +126,54 @@ async def ask_gemini(prompt: str) -> str:
         MODEL_ERRORS["gemini"] = str(e)[:300]
         return ""
 
-async def ask_openai(prompt: str) -> str:
+def _collect_response_urls(response) -> list[str]:
+    urls: list[str] = []
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-search-preview",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = response.choices[0].message.content or ""
-        print(f"OpenAI OK: {len(text)} chars")
-        return text
+        for item in getattr(response, "output", []) or []:
+            for content in getattr(item, "content", []) or []:
+                for ann in getattr(content, "annotations", []) or []:
+                    url = getattr(ann, "url", None)
+                    if url:
+                        urls.append(url)
     except Exception as e:
-        print(f"OpenAI error: {e}")
-        MODEL_ERRORS["chatgpt"] = str(e)[:300]
-        return ""
+        print(f"Annotation parse warning: {e}")
+    return urls
+
+async def ask_openai(prompt: str, use_search: bool = False) -> str:
+    if not use_search:
+        try:
+            response = await openai_client.responses.create(
+                model=OPENAI_UTILITY_MODEL,
+                input=prompt,
+            )
+            return response.output_text or ""
+        except Exception as e:
+            print(f"OpenAI utility error: {e}")
+            MODEL_ERRORS["chatgpt"] = str(e)[:300]
+            return ""
+
+    last_error = None
+    for model in [OPENAI_SEARCH_MODEL] + OPENAI_SEARCH_FALLBACKS:
+        try:
+            response = await openai_client.responses.create(
+                model=model,
+                tools=[{"type": "web_search"}],
+                input=prompt,
+            )
+            text = response.output_text or ""
+            urls = _collect_response_urls(response)
+            if urls:
+                text += "\n\nSources: " + " ".join(dict.fromkeys(urls))
+            print(f"OpenAI OK ({model}): {len(text)} chars, {len(urls)} cited urls")
+            MODEL_ERRORS.pop("chatgpt", None)
+            return text
+        except Exception as e:
+            last_error = e
+            print(f"OpenAI error on {model}: {e}")
+            continue
+
+    MODEL_ERRORS["chatgpt"] = str(last_error)[:300]
+    return ""
 
 async def enrich_brand(brand: str, description: str = "") -> dict:
     clean_brand = brand
@@ -207,7 +247,7 @@ async def run_audit(request: AuditRequest):
     async def run_prompt(prompt):
         gemini_answer, openai_answer = await asyncio.gather(
             ask_gemini(prompt),
-            ask_openai(prompt)
+            ask_openai(prompt, use_search=True)
         )
         return prompt, gemini_answer, openai_answer
 
@@ -364,11 +404,11 @@ Data: """ + summary)
 @app.get("/health-models")
 async def health_models():
     MODEL_ERRORS.clear()
-    probe = "Say the single word: pong"
-    g, o = await asyncio.gather(ask_gemini(probe), ask_openai(probe))
+    probe = "What is the best project management software? Name two tools."
+    g, o = await asyncio.gather(ask_gemini(probe), ask_openai(probe, use_search=True))
     return {
-        "gemini": {"ok": bool(g), "chars": len(g), "error": MODEL_ERRORS.get("gemini")},
-        "chatgpt": {"ok": bool(o), "chars": len(o), "error": MODEL_ERRORS.get("chatgpt")},
+        "gemini": {"ok": bool(g), "chars": len(g), "model": GEMINI_MODEL, "error": MODEL_ERRORS.get("gemini")},
+        "chatgpt": {"ok": bool(o), "chars": len(o), "model": OPENAI_SEARCH_MODEL, "urls_found": len(extract_urls(o)), "error": MODEL_ERRORS.get("chatgpt")},
     }
 
 @app.get("/")
