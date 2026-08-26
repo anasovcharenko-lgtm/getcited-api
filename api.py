@@ -413,7 +413,8 @@ async def run_audit(request: AuditRequest):
 
     gemini_mentions = sum(1 for r in results if r["gemini"]["mentioned"])
     openai_mentions = sum(1 for r in results if r["chatgpt"]["mentioned"])
-    total_checks = len(prompts) * 2
+    active_models = 1 + (1 if GEMINI_ENABLED else 0)
+    total_checks = len(prompts) * active_models
     visibility_score = int((gemini_mentions + openai_mentions) / total_checks * 100) if total_checks > 0 else 0
 
     mentions_with_link_count = sum(1 for r in results for m in ("gemini", "chatgpt") if r[m]["mentioned_with_link"])
