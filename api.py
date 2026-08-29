@@ -76,17 +76,20 @@ def url_matches_name(url: str, domain_hint: str, name: str) -> bool:
     slug = name_to_slug(name)
     return bool(slug) and slug in re.sub(r'[^a-z0-9]', '', domain)
 
-def trim_answer(text: str, limit: int = 1800) -> str:
-    """Keep the real AI answer for display, but cap it so a 10-prompt audit
-    doesn't balloon the response payload."""
+def trim_answer(text: str, limit: int = 3000) -> str:
+    """Keep the real AI answer for display, but cap it so a multi-prompt audit
+    doesn't balloon the payload. Cuts on a line boundary because these answers
+    are markdown - slicing mid-table leaves a broken table on screen."""
     if not text:
         return ""
-    # Drop the "Sources: ..." block we append internally — the URLs are already
-    # surfaced separately as cited_domains, and they read as noise in the answer.
     text = re.split(r'\n\nSources: ', text)[0].strip()
     if len(text) <= limit:
         return text
-    return text[:limit].rsplit(" ", 1)[0] + "…"
+    cut = text[:limit]
+    nl = cut.rfind("\n")
+    if nl > limit * 0.5:
+        cut = cut[:nl]
+    return cut.rstrip() + "\n\n…"
 
 def unique_domains(urls: list[str]) -> list[str]:
     seen = []
