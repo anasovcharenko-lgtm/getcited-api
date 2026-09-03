@@ -8,7 +8,8 @@ import re
 import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-
+from html.parser import HTMLParser
+import httpx
 load_dotenv()
 
 app = FastAPI()
@@ -544,7 +545,151 @@ async def debug_prompt(q: str = "best AI visibility tracking tools"):
         }
     except Exception as e:
         return {"error": str(e)[:500]}
+# ─────────────────────────────────────────────────────────────
+# Source gap: do the pages the models cite actually mention you?
+# ─────────────────────────────────────────────────────────────
 
+SOURCE_CHECK_CONCURRENCY = 6
+SOURCE_CHECK_TIMEOUT = 12
+SOURCE_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+class _PageText(HTMLParser):
+    """Readable text only. Scripts and styles would produce false positives
+    when searching a page for a brand name."""
+
+    SKIP = {"script", "style", "noscript", "svg"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip:
+            t = data.strip()
+            if t:
+                self.parts.append(t)
+
+    def text(self):
+        return " ".join(self.parts)
+
+
+def _reason_for_status(code: int) -> str:
+    if code == 403:
+        return "the site blocked us (403) - bot protection such as Cloudflare"
+    if code == 404:
+        return "page no longer exists (404)"
+    if code in (401, 402):
+        return "needs a login or paid subscription"
+    if code == 429:
+        return "the site rate-limited us (429) - try again later"
+    if 500 <= code < 600:
+        return f"the site returned a server error ({code})"
+    return f"unexpected response ({code})"
+
+
+async def _fetch_page_text(client, url: str) -> tuple[str, str]:
+    """Return (text, reason). Exactly one of them is non-empty.
+
+    The reason is written for whoever reads the report, not for a log file:
+    'we could not check this' is only useful if it also says why.
+    """
+    try:
+        r = await client.get(url, follow_redirects=True, timeout=SOURCE_CHECK_TIMEOUT,
+                             headers={"User-Agent": SOURCE_BROWSER_UA})
+    except httpx.TimeoutException:
+        return "", f"took longer than {SOURCE_CHECK_TIMEOUT}s to respond"
+    except httpx.ConnectError:
+        return "", "could not connect - domain may be dead or blocking us"
+    except Exception as exc:
+        return "", f"fetch failed ({type(exc).__name__})"
+
+    if r.status_code != 200:
+        return "", _reason_for_status(r.status_code)
+
+    ctype = r.headers.get("content-type", "").split(";")[0].strip()
+    if ctype and "html" not in ctype:
+        return "", f"not a web page (content type: {ctype})"
+
+    parser = _PageText()
+    try:
+        parser.feed(r.text)
+    except Exception:
+        return "", "page markup could not be parsed"
+
+    text = parser.text()
+    if len(text) < 400:
+        return "", (f"only {len(text)} characters of text - the content is most likely "
+                    "rendered by JavaScript, which we cannot read")
+    return text, ""
+
+
+def _name_in_text(text: str, name: str) -> bool:
+    """Word-boundary match, so 'Peec' does not fire inside 'Peecock'."""
+    if not name:
+        return False
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+class SourceGapRequest(BaseModel):
+    urls: list[str]
+    brand: str
+    competitors: list[str] = []
+    brand_domain: str = ""
+
+
+@app.post("/source-gap")
+async def source_gap(request: SourceGapRequest):
+    urls = [u for u in dict.fromkeys(request.urls) if u.startswith("http")][:25]
+    if not urls:
+        return {"results": [], "summary": {"absent": 0, "present": 0, "unreadable": 0}}
+
+    sem = asyncio.Semaphore(SOURCE_CHECK_CONCURRENCY)
+
+    async with httpx.AsyncClient() as client:
+        async def one(url: str) -> dict:
+            async with sem:
+                text, reason = await _fetch_page_text(client, url)
+
+            domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
+            base = {"url": url, "domain": domain}
+
+            if reason:
+                return {**base, "status": "unreadable", "reason": reason,
+                        "competitors_on_page": []}
+
+            found = [c for c in request.competitors if _name_in_text(text, c)]
+            you_here = _name_in_text(text, request.brand)
+            if not you_here and request.brand_domain:
+                you_here = request.brand_domain.lower() in text.lower()
+
+            return {**base,
+                    "status": "present" if you_here else "absent",
+                    "reason": "",
+                    "competitors_on_page": found}
+
+        results = await asyncio.gather(*[one(u) for u in urls])
+
+    # Genuine gaps first, then pages where you appear but the model ignored you,
+    # then the ones we could not read at all.
+    order = {"absent": 0, "present": 1, "unreadable": 2}
+    results = sorted(results, key=lambda r: (order[r["status"]],
+                                             -len(r["competitors_on_page"])))
+
+    summary = {k: sum(1 for r in results if r["status"] == k)
+               for k in ("absent", "present", "unreadable")}
+    return {"results": results, "summary": summary}
 @app.get("/health-models")
 async def health_models():
     """Quick check of which AI models actually respond. Use this to tell a real
