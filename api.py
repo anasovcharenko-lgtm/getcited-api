@@ -256,7 +256,50 @@ Answer in JSON only, no other text:
     except Exception:
         return {"category": description or clean_brand + " category", "known": False, "original_brand": brand, "clean_brand": clean_brand}
 
-PROMPT_CACHE: dict[str, list[str]] = {}
+PROMPT_CACHE: dict[str, list[dict]] = {}
+
+# What the audit asks, and in what proportion. Only 'brand' style queries were
+# being generated before, which is why the audit kept surfacing vendor docs
+# instead of independent write-ups.
+PROMPT_MIX = [("problem", 0.5), ("comparison", 0.34), ("brand", 0.16)]
+
+PROMPT_TYPE_GUIDE = {
+    "problem": (
+        "Someone with the problem who does not know this category of tool exists. "
+        "They describe the symptom, not the solution.\n"
+        "Examples: why does my brand not show up in chatgpt / "
+        "how do i know what ai says about my company / "
+        "my competitors appear in ai answers and i don't"
+    ),
+    "comparison": (
+        "Someone who knows the category and is choosing between options.\n"
+        "Examples: best ai visibility tracking tools / "
+        "cheapest way to monitor brand mentions in ai / "
+        "ai visibility tools compared"
+    ),
+    "brand": (
+        "Someone who already names a specific product in this category.\n"
+        "Examples: profound alternatives / is otterly worth it / "
+        "peec ai vs profound"
+    ),
+}
+
+
+def split_counts(total: int) -> dict:
+    """Turn the mix into whole numbers that add up to `total` exactly."""
+    counts = {}
+    assigned = 0
+    for i, (name, share) in enumerate(PROMPT_MIX):
+        if i == len(PROMPT_MIX) - 1:
+            counts[name] = total - assigned      # last one absorbs the rounding
+        else:
+            n = max(1, round(total * share)) if total >= len(PROMPT_MIX) else 0
+            counts[name] = n
+            assigned += n
+    if counts[PROMPT_MIX[-1][0]] < 0:
+        counts[PROMPT_MIX[-1][0]] = 0
+    return counts
+
 
 def _is_junk_prompt(p: str) -> bool:
     low = p.lower()
@@ -266,24 +309,87 @@ def _is_junk_prompt(p: str) -> bool:
         return True
     return False
 
-async def generate_prompts(brand: str, category: str) -> list[str]:
+
+def _build_generation_prompt(brand: str, category: str, counts: dict) -> str:
+    blocks = []
+    for name, n in counts.items():
+        if n <= 0:
+            continue
+        blocks.append(f"{n} of type {name.upper()}:\n{PROMPT_TYPE_GUIDE[name]}")
+    return (
+        f"Category: {category}\n\n"
+        f"Write search queries real people type into ChatGPT about this category.\n\n"
+        + "\n\n".join(blocks) +
+        "\n\nRules:\n"
+        "- 3 to 10 words each. Plain lowercase, how people actually type.\n"
+        "- NEVER use placeholders like 'X vs Y' or brackets.\n"
+        f"- Do not mention {brand}.\n"
+        "- Stay inside the stated category, do not drift to adjacent markets.\n\n"
+        "Output format, one per line, nothing else:\n"
+        "PROBLEM: the query\n"
+        "COMPARISON: the query\n"
+        "BRAND: the query"
+    )
+
+
+def _parse_generated(response: str, counts: dict) -> list[dict]:
+    """Read the labelled lines back. Unlabelled lines are dropped: they are
+    stray prose, not queries the model intended to produce."""
+    out = []
+    per_type = {k: 0 for k in counts}
+    for raw in response.strip().split("\n"):
+        line = raw.strip().lstrip("-*\u2022 ").strip()
+        if not line:
+            continue
+        ptype, _, text = line.partition(":")
+        ptype = ptype.strip().lower()
+        if ptype not in counts:
+            continue
+        text = text.strip().strip('"\'')
+        if not text or _is_junk_prompt(text):
+            continue
+        if per_type.get(ptype, 0) >= counts.get(ptype, 0):
+            continue                              # this bucket is already full
+        per_type[ptype] += 1
+        out.append({"text": text[0].upper() + text[1:], "type": ptype})
+    return out
+
+
+def _fallback_prompts(category: str, total: int) -> list[dict]:
+    """Used when generation returns nothing usable. Covers all three types
+    rather than only comparison queries."""
+    base = [
+        {"text": "Why is my brand not showing up in AI answers", "type": "problem"},
+        {"text": "How do I know what AI says about my company", "type": "problem"},
+        {"text": "How to get mentioned in ChatGPT answers", "type": "problem"},
+        {"text": f"Best {category} tools", "type": "comparison"},
+        {"text": f"{category} compared", "type": "comparison"},
+        {"text": f"Cheapest {category} tool", "type": "comparison"},
+    ]
+    return base[:total]
+
+
+async def generate_prompts(brand: str, category: str) -> list[dict]:
     cache_key = category.strip().lower()
     if cache_key in PROMPT_CACHE:
         print(f"Prompt cache hit: {cache_key}")
         return PROMPT_CACHE[cache_key]
-    response = await ask_openai("Generate exactly " + str(PROMPT_COUNT) + " realistic prompts that someone would type into ChatGPT when searching for or comparing tools in this category: " + category + """
 
-Rules:
-- These are BUYER prompts - people who want to find or compare tools
-- Mix: best X for Y, X vs Y, alternatives to competitor, how to track X, which tool for X
-- Be SPECIFIC to the category
-- Do NOT include the brand name in the prompts
-- Return ONLY the prompts, one per line, no numbering, no explanation""")
-    prompts = [p.strip().capitalize() for p in response.strip().split("\n") if p.strip()][:PROMPT_COUNT]
-    if prompts:
-        PROMPT_CACHE[cache_key] = prompts
+    counts = split_counts(PROMPT_COUNT)
+    response = await ask_openai(_build_generation_prompt(brand, category, counts))
+    prompts = _parse_generated(response, counts)
+
+    if len(prompts) < 2:
+        print("  prompt generation produced too little, using fallback")
+        prompts = _fallback_prompts(category, PROMPT_COUNT)
+
+    by_type = {}
+    for p in prompts:
+        by_type[p["type"]] = by_type.get(p["type"], 0) + 1
+    print(f"  prompts by type: {by_type}")
+
+    PROMPT_CACHE[cache_key] = prompts
     return prompts
-
 @app.post("/check-brand")
 async def check_brand(request: dict):
     brand = request.get("brand", "")
@@ -311,7 +417,9 @@ async def run_audit(request: AuditRequest):
     brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
     clean_brand = brand_info.get("clean_brand", brand)
-    prompts = await generate_prompts(clean_brand, category)
+    prompt_specs = await generate_prompts(clean_brand, category)
+    prompts = [p["text"] for p in prompt_specs]
+    prompt_type_by_text = {p["text"]: p["type"] for p in prompt_specs}
 
     # Figure out the brand's own domain if we can — this is what lets us tell
     # "mentioned with a link to your site" (mention) apart from "named with no
@@ -391,6 +499,7 @@ async def run_audit(request: AuditRequest):
 
         results.append({
             "prompt": prompt,
+            "prompt_type": prompt_type_by_text.get(prompt, "comparison"),
             "_gemini_raw": gemini_answer,
             "_chatgpt_raw": openai_answer,
             "gemini": {
