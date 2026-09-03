@@ -542,6 +542,7 @@ async def debug_prompt(q: str = "best AI visibility tracking tools"):
             "text_preview": text[:300],
             "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
             "reasoning_tokens": rt,
+            "urls": _collect_response_urls(response),
         }
     except Exception as e:
         return {"error": str(e)[:500]}
