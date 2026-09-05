@@ -860,7 +860,10 @@ async def _fetch_reddit(client, url: str) -> tuple[str, str, str]:
     try:
         data = r.json()
     except Exception:
-        return "", "", "reddit did not return JSON (link may not be a thread)"
+        # Reddit answers 200 with an HTML "Blocked" page rather than an error,
+        # so a JSON parse failure here almost always means we were blocked.
+        return "", "", ("reddit blocked the request - add REDDIT_CLIENT_ID and "
+                        "REDDIT_CLIENT_SECRET in Railway to read it")
     if not isinstance(data, list) or not data:
         return "", "", "reddit response had no thread data"
 
