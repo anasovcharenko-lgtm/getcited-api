@@ -9,6 +9,7 @@ import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from html.parser import HTMLParser
+from urllib.parse import urlparse, parse_qs
 import httpx
 load_dotenv()
 
@@ -743,7 +744,97 @@ async def _fetch_page_text(client, url: str) -> tuple[str, str]:
                     "rendered by JavaScript, which we cannot read")
     return text, ""
 
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+REDDIT_COMMENT_LIMIT = int(os.getenv("REDDIT_COMMENT_LIMIT", "60"))
 
+
+def _is_reddit(url: str) -> bool:
+    return urlparse(url).netloc.lower().endswith("reddit.com")
+
+
+def _is_youtube(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host.endswith("youtube.com") or host.endswith("youtu.be")
+
+
+def _youtube_video_id(url: str) -> str:
+    p = urlparse(url)
+    if p.netloc.lower().endswith("youtu.be"):
+        return p.path.lstrip("/").split("/")[0]
+    if "/shorts/" in p.path or "/embed/" in p.path:
+        return p.path.rstrip("/").split("/")[-1]
+    return (parse_qs(p.query).get("v") or [""])[0]
+
+
+def _walk_reddit_comments(node, out: list, budget: list) -> None:
+    if budget[0] <= 0 or not isinstance(node, dict):
+        return
+    data = node.get("data", {})
+    body = data.get("body")
+    if isinstance(body, str) and body.strip():
+        out.append(body)
+        budget[0] -= 1
+    replies = data.get("replies")
+    if isinstance(replies, dict):
+        for child in replies.get("data", {}).get("children", []):
+            _walk_reddit_comments(child, out, budget)
+    for child in data.get("children", []) or []:
+        _walk_reddit_comments(child, out, budget)
+
+
+async def _fetch_reddit(client, url: str) -> tuple[str, str, str]:
+    clean = url.split("?")[0].rstrip("/")
+    try:
+        r = await client.get(clean + ".json", timeout=SOURCE_CHECK_TIMEOUT,
+                             headers={"User-Agent": SOURCE_BROWSER_UA},
+                             follow_redirects=True)
+    except Exception as exc:
+        return "", "", f"reddit fetch failed ({type(exc).__name__})"
+    if r.status_code != 200:
+        return "", "", f"reddit returned {r.status_code}"
+    try:
+        data = r.json()
+    except Exception:
+        return "", "", "reddit did not return JSON (link may not be a thread)"
+    if not isinstance(data, list) or not data:
+        return "", "", "reddit response had no thread data"
+
+    post_parts = []
+    for child in data[0].get("data", {}).get("children", []):
+        d = child.get("data", {})
+        for field in ("title", "selftext"):
+            v = d.get(field)
+            if isinstance(v, str) and v.strip():
+                post_parts.append(v)
+
+    comments = []
+    if len(data) > 1:
+        _walk_reddit_comments(data[1], comments, [REDDIT_COMMENT_LIMIT])
+
+    return " ".join(post_parts), " ".join(comments), ""
+
+
+async def _fetch_youtube(client, url: str) -> tuple[str, str]:
+    if not YOUTUBE_API_KEY:
+        return "", "no YouTube API key configured"
+    vid = _youtube_video_id(url)
+    if not vid:
+        return "", "could not read a video id from this link"
+    try:
+        r = await client.get("https://www.googleapis.com/youtube/v3/videos",
+                             params={"part": "snippet", "id": vid, "key": YOUTUBE_API_KEY},
+                             timeout=SOURCE_CHECK_TIMEOUT)
+    except Exception as exc:
+        return "", f"YouTube API request failed ({type(exc).__name__})"
+    if r.status_code == 403:
+        return "", "YouTube API refused the key (quota or restrictions)"
+    if r.status_code != 200:
+        return "", f"YouTube API returned {r.status_code}"
+    items = r.json().get("items", [])
+    if not items:
+        return "", "video not found or private"
+    sn = items[0].get("snippet", {})
+    return f"{sn.get('title','')} {sn.get('description','')}".strip(), ""
 def _name_in_text(text: str, name: str) -> bool:
     """Word-boundary match, so 'Peec' does not fire inside 'Peecock'."""
     if not name:
@@ -769,8 +860,14 @@ async def source_gap(request: SourceGapRequest):
 
     async with httpx.AsyncClient() as client:
         async def one(url: str) -> dict:
+            comment_text = ""
             async with sem:
-                text, reason = await _fetch_page_text(client, url)
+                if _is_reddit(url):
+                    text, comment_text, reason = await _fetch_reddit(client, url)
+                elif _is_youtube(url):
+                    text, reason = await _fetch_youtube(client, url)
+                else:
+                    text, reason = await _fetch_page_text(client, url)
 
             domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
             base = {"url": url, "domain": domain}
