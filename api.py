@@ -784,6 +784,8 @@ def _walk_reddit_comments(node, out: list, budget: list) -> None:
 
 async def _fetch_reddit(client, url: str) -> tuple[str, str, str]:
     clean = url.split("?")[0].rstrip("/")
+    # www.reddit.com blocks datacentre IPs; the old interface is more tolerant.
+    clean = clean.replace("://www.reddit.com", "://old.reddit.com").replace("://reddit.com", "://old.reddit.com")
     try:
         r = await client.get(clean + ".json", timeout=SOURCE_CHECK_TIMEOUT,
                              headers={"User-Agent": SOURCE_BROWSER_UA},
