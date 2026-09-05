@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from google import genai
 from openai import AsyncOpenAI
 import os
+import time
 import re
 import asyncio
 from datetime import datetime, timezone
@@ -781,17 +782,79 @@ def _walk_reddit_comments(node, out: list, budget: list) -> None:
     for child in data.get("children", []) or []:
         _walk_reddit_comments(child, out, budget)
 
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
 
-async def _fetch_reddit(client, url: str) -> tuple[str, str, str]:
-    clean = url.split("?")[0].rstrip("/")
-    # www.reddit.com blocks datacentre IPs; the old interface is more tolerant.
-    clean = clean.replace("://www.reddit.com", "://old.reddit.com").replace("://reddit.com", "://old.reddit.com")
+# Tokens last an hour. Cached so a 20-URL check authenticates once, not 20 times.
+_reddit_token = {"value": "", "expires": 0.0}
+
+
+async def _reddit_token_get(client) -> tuple[str, str]:
+    """Return (token, reason).
+
+    An empty token with an empty reason means we are running anonymously on
+    purpose - no credentials configured yet - rather than failing.
+    """
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        return "", ""
+
+    if _reddit_token["value"] and time.time() < _reddit_token["expires"]:
+        return _reddit_token["value"], ""
+
     try:
-        r = await client.get(clean + ".json", timeout=SOURCE_CHECK_TIMEOUT,
-                             headers={"User-Agent": SOURCE_BROWSER_UA},
-                             follow_redirects=True)
+        r = await client.post(
+            "https://www.reddit.com/api/v1/access_token",
+            data={"grant_type": "client_credentials"},
+            auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            headers={"User-Agent": "getcited/1.0 (source gap checker)"},
+            timeout=SOURCE_CHECK_TIMEOUT,
+        )
+    except Exception as exc:
+        return "", f"reddit auth failed ({type(exc).__name__})"
+
+    if r.status_code != 200:
+        return "", f"reddit auth returned {r.status_code} - check the client id and secret"
+
+    data = r.json()
+    token = data.get("access_token", "")
+    if not token:
+        return "", "reddit auth returned no token"
+
+    # Refresh a minute early so no request fires on a just-expired token.
+    _reddit_token["value"] = token
+    _reddit_token["expires"] = time.time() + int(data.get("expires_in", 3600)) - 60
+    return token, ""
+
+
+def _reddit_json_url(url: str, authed: bool) -> str:
+    """Authenticated requests must go to oauth.reddit.com. Anonymous ones have
+    a slightly better chance on old.reddit.com."""
+    clean = url.split("?")[0].rstrip("/")
+    if authed:
+        for host in ("://www.reddit.com", "://old.reddit.com", "://reddit.com"):
+            clean = clean.replace(host, "://oauth.reddit.com")
+    else:
+        clean = clean.replace("://www.reddit.com", "://old.reddit.com")
+        clean = clean.replace("://reddit.com", "://old.reddit.com")
+    return clean + ".json"
+async def _fetch_reddit(client, url: str) -> tuple[str, str, str]:
+    token, auth_reason = await _reddit_token_get(client)
+    if auth_reason:
+        return "", "", auth_reason
+
+    headers = {"User-Agent": "getcited/1.0 (source gap checker)"}
+    if token:
+        headers["Authorization"] = f"bearer {token}"
+
+    try:
+        r = await client.get(_reddit_json_url(url, bool(token)),
+                             timeout=SOURCE_CHECK_TIMEOUT,
+                             headers=headers, follow_redirects=True)
     except Exception as exc:
         return "", "", f"reddit fetch failed ({type(exc).__name__})"
+    if r.status_code == 403 and not token:
+        return "", "", ("reddit blocked the request - add REDDIT_CLIENT_ID and "
+                        "REDDIT_CLIENT_SECRET in Railway to read it")
     if r.status_code != 200:
         return "", "", f"reddit returned {r.status_code}"
     try:
