@@ -69,6 +69,51 @@ def extract_domain(url: str) -> str:
     except Exception:
         return url
 
+_SEPARATORS = " \t\n\r-_./\\"
+
+
+def _strip_separators(text: str) -> tuple[str, list[int]]:
+    """Return the text without separators, plus a map back to original indexes.
+
+    Keeping the map is what lets us drop separators for matching and still test
+    word boundaries against the real text.
+    """
+    out, index_map = [], []
+    for i, ch in enumerate(text):
+        if ch not in _SEPARATORS:
+            out.append(ch.lower())
+            index_map.append(i)
+    return "".join(out), index_map
+
+
+def brand_in_text(text: str, name: str) -> bool:
+    """Does this brand appear in this text, however either side spells it?
+
+    Models write the same brand as "Set Loyalty", "SetLoyalty" or "Set-Loyalty"
+    depending on the sentence, and users type it either way in the form. Matching
+    the literal string reported zero visibility for brands that were in fact
+    named. Separators are ignored on both sides; word boundaries are still
+    checked against the original text so "Peec" does not match "Peecock".
+    """
+    if not name or not text:
+        return False
+    flat_name, _ = _strip_separators(name)
+    if not flat_name:
+        return False
+    flat_text, index_map = _strip_separators(text)
+
+    pos = flat_text.find(flat_name)
+    while pos != -1:
+        start_i = index_map[pos]
+        end_i = index_map[pos + len(flat_name) - 1]
+        before = text[start_i - 1] if start_i > 0 else ""
+        after = text[end_i + 1] if end_i + 1 < len(text) else ""
+        if not before.isalnum() and not after.isalnum():
+            return True
+        pos = flat_text.find(flat_name, pos + 1)
+    return False
+
+
 def extract_brand_from_url(url: str) -> str:
     domain = re.sub(r'https?://', '', url)
     domain = domain.split('/')[0]
@@ -740,14 +785,14 @@ async def run_audit(request: AuditRequest):
     def process_model(prompt, answer, competitors):
         nonlocal all_urls
         answer_lower = answer.lower()
-        name_mentioned = (" " + clean_brand.lower() + " ") in (" " + answer_lower + " ") or (clean_brand.lower() + ".") in answer_lower
+        name_mentioned = brand_in_text(answer, clean_brand)
         urls = extract_urls(answer)
         has_own_link = any(url_matches_name(u, brand_domain, clean_brand) for u in urls)
 
         competitors_with_link = []
         competitors_without_link = []
         for c in competitors:
-            if c.lower() not in answer_lower:
+            if not brand_in_text(answer, c):
                 continue
             # A known domain is an exact test; without one we fall back to
             # matching the name against the domain, which is a guess.
@@ -836,8 +881,8 @@ async def run_audit(request: AuditRequest):
     for b in all_brands:
         search_b = get_search_name(b)
         is_you = b == brand or b == clean_brand
-        g = sum(1 for r in results if search_b.lower() in r["_gemini_raw"].lower())
-        c = sum(1 for r in results if search_b.lower() in r["_chatgpt_raw"].lower())
+        g = sum(1 for r in results if brand_in_text(r["_gemini_raw"], search_b))
+        c = sum(1 for r in results if brand_in_text(r["_chatgpt_raw"], search_b))
         if is_you:
             with_link = mentions_with_link_count
             without_link = mentions_without_link_count
@@ -1197,11 +1242,8 @@ async def _fetch_youtube(client, url: str) -> tuple[str, str]:
     sn = items[0].get("snippet", {})
     return f"{sn.get('title','')} {sn.get('description','')}".strip(), ""
 def _name_in_text(text: str, name: str) -> bool:
-    """Word-boundary match, so 'Peec' does not fire inside 'Peecock'."""
-    if not name:
-        return False
-    pattern = r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])"
-    return re.search(pattern, text, re.IGNORECASE) is not None
+    """Same rule as the audit uses, so a page and an answer are judged alike."""
+    return brand_in_text(text, name)
 
 
 class SourceGapRequest(BaseModel):
