@@ -26,10 +26,22 @@ app.add_middleware(
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+class Competitor(BaseModel):
+    name: str
+    website: str = ""
+
+
 class AuditRequest(BaseModel):
     brand: str
+    # Legacy: names only. Kept so older clients keep working.
     competitors: list[str] = []
+    # Preferred: name plus site. The site is what makes link matching exact
+    # instead of guessing a domain from the name.
+    competitor_list: list[Competitor] = []
     description: str = ""
+    # Language is separate from country on purpose: a UK-targeted brand can
+    # have a Russian-speaking audience, and one field cannot express that.
+    language: str = ""
     # The market being sold INTO, not where the company sits. A US company
     # targeting the UK should be measured on UK results, in English.
     country: str = "US"
@@ -422,17 +434,20 @@ def _fallback_prompts(category: str, total: int) -> list[dict]:
 
 async def generate_prompts(brand: str, category: str,
                            competitors: list[str] | None = None,
-                           country: str = "US") -> list[dict]:
+                           country: str = "US",
+                           language: str = "") -> list[dict]:
     # Competitors change the brand-type prompts, so they belong in the key.
     # Market changes both the language and the rivals, so it belongs in the key.
-    cache_key = "|".join([category.strip().lower(), (country or "US").upper(),
+    language = language or market_language(country)
+    # Language is in the key as well as country: same market, different audience
+    # language means different prompts.
+    cache_key = "|".join([category.strip().lower(), (country or "US").upper(), language,
                           ",".join(sorted(c.lower() for c in (competitors or [])))])
     if cache_key in PROMPT_CACHE:
         print(f"Prompt cache hit: {cache_key}")
         return PROMPT_CACHE[cache_key]
 
     counts = split_counts(PROMPT_COUNT)
-    language = market_language(country)
     response = await ask_openai(_build_generation_prompt(brand, category, counts, competitors, language))
     prompts = _parse_generated(response, counts)
 
@@ -459,11 +474,26 @@ AUDIT_CACHE_TTL = int(os.getenv("AUDIT_CACHE_TTL", "3600"))
 @app.post("/audit")
 async def run_audit(request: AuditRequest):
     brand = request.brand
-    competitors = request.competitors
+    # Both shapes collapse to: a list of names, plus domains where we know them.
+    if request.competitor_list:
+        competitors = [c.name.strip() for c in request.competitor_list if c.name.strip()]
+        competitor_domains = {
+            c.name.strip(): extract_domain(
+                c.website if c.website.startswith("http") else "https://" + c.website
+            )
+            for c in request.competitor_list
+            if c.name.strip() and c.website.strip()
+        }
+    else:
+        competitors = request.competitors
+        competitor_domains = {}
     description = request.description
     website = request.website.strip()
 
-    cache_key = "|".join([brand.strip().lower(), ",".join(sorted(c.lower() for c in competitors)), website.lower()])
+    cache_key = "|".join([brand.strip().lower(),
+                          ",".join(sorted(c.lower() for c in competitors)),
+                          website.lower(), (request.country or "US").upper(),
+                          (request.language or "")])
     cached = AUDIT_CACHE.get(cache_key)
     if cached and (asyncio.get_event_loop().time() - cached[0]) < AUDIT_CACHE_TTL:
         print(f"Audit cache hit: {cache_key}")
@@ -474,7 +504,8 @@ async def run_audit(request: AuditRequest):
     brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
     clean_brand = brand_info.get("clean_brand", brand)
-    prompt_specs = await generate_prompts(clean_brand, category, competitors, request.country)
+    language = (request.language or "").strip() or market_language(request.country)
+    prompt_specs = await generate_prompts(clean_brand, category, competitors, request.country, language)
     prompts = [p["text"] for p in prompt_specs]
     prompt_type_by_text = {p["text"]: p["type"] for p in prompt_specs}
 
@@ -515,7 +546,9 @@ async def run_audit(request: AuditRequest):
         for c in competitors:
             if c.lower() not in answer_lower:
                 continue
-            if any(url_matches_name(u, "", c) for u in urls):
+            # A known domain is an exact test; without one we fall back to
+            # matching the name against the domain, which is a guess.
+            if any(url_matches_name(u, competitor_domains.get(c, ""), c) for u in urls):
                 competitors_with_link.append(c)
             else:
                 competitors_without_link.append(c)
@@ -641,7 +674,7 @@ Data: """ + summary)
         "category": category,
         "brand_domain": brand_domain,
         "country": (request.country or "US").upper(),
-        "language": market_language(request.country),
+        "language": language,
         "run_at": datetime.now(timezone.utc).isoformat(),
         "models_used": {
             "chatgpt": OPENAI_SEARCH_MODEL,
