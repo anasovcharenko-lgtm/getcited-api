@@ -325,14 +325,21 @@ PROMPT_TYPE_GUIDE = {
         "ai visibility tools compared"
     ),
     "brand": (
-        "Someone who already names a specific product in this category.\n"
+        "Someone comparing a named competitor against other options, or looking "
+        "for an alternative to it. The point is to find out whether this brand "
+        "surfaces when a buyer is already considering a rival.\n"
+        "Only write queries where a DIFFERENT product could legitimately appear "
+        "in the answer: alternatives, comparisons, 'or', 'instead of'.\n"
+        "NEVER write review or opinion queries about a competitor "
+        "('X reviews', 'is X any good', 'X pricing'). Nobody else can appear in "
+        "those, so they measure nothing.\n"
         "ALWAYS pair the product name with a category word. Many product names "
-        "are also ordinary English words, and on its own the model answers about "
-        "the word instead of the product: 'profound alternatives' returns "
-        "synonyms for 'deeply thoughtful'. Write 'profound ai visibility "
-        "alternatives' instead.\n"
-        "Examples: otterly ai visibility review / peec ai vs profound analytics / "
-        "alternatives to profound brand tracking"
+        "are also ordinary words, and alone the model answers about the word "
+        "instead of the product: 'profound alternatives' returns synonyms for "
+        "'deeply thoughtful'.\n"
+        "Examples: alternatives to profound ai visibility / "
+        "peec ai vs profound brand tracking / "
+        "otterly ai visibility or profound"
     ),
 }
 
