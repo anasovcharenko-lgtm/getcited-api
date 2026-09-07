@@ -30,6 +30,9 @@ class AuditRequest(BaseModel):
     brand: str
     competitors: list[str] = []
     description: str = ""
+    # The market being sold INTO, not where the company sits. A US company
+    # targeting the UK should be measured on UK results, in English.
+    country: str = "US"
     website: str = ""
 
 def extract_urls(text: str) -> list[str]:
@@ -131,6 +134,26 @@ async def get_site_context(url: str) -> str:
         print(f"Scrape error: {e}")
         return ""
 
+# Which language buyers in this market actually type. Prompts generated in the
+# wrong language measure a market the client does not sell in.
+MARKET_LANGUAGES = {
+    "US": "English", "GB": "English", "CA": "English", "AU": "English",
+    "IE": "English", "NZ": "English", "IN": "English", "SG": "English",
+    "RU": "Russian", "BY": "Russian", "KZ": "Russian",
+    "DE": "German", "AT": "German", "CH": "German",
+    "FR": "French", "BE": "French",
+    "ES": "Spanish", "MX": "Spanish", "AR": "Spanish",
+    "IT": "Italian", "PT": "Portuguese", "BR": "Portuguese",
+    "NL": "Dutch", "PL": "Polish", "TR": "Turkish",
+    "JP": "Japanese", "KR": "Korean", "CN": "Chinese",
+    "UA": "Ukrainian", "SE": "Swedish", "NO": "Norwegian", "DK": "Danish",
+}
+
+
+def market_language(country: str) -> str:
+    return MARKET_LANGUAGES.get((country or "US").upper(), "English")
+
+
 MODEL_ERRORS: dict[str, str] = {}
 
 # gpt-4o-search-preview was shut down on 2026-07-23. Web search now runs through
@@ -163,6 +186,16 @@ async def ask_gemini(prompt: str) -> str:
         MODEL_ERRORS["gemini"] = str(e)[:300]
         return ""
 
+def search_tool(country: str = "") -> dict:
+    """Web search results are location-influenced, so the same query returns
+    different sources in London and Moscow. Without this the audit measures
+    whatever market OpenAI defaults to, not the client's."""
+    tool: dict = {"type": "web_search"}
+    if country:
+        tool["user_location"] = {"type": "approximate", "country": country.upper()}
+    return tool
+
+
 def _collect_response_urls(response) -> list[str]:
     """Pull cited URLs out of a Responses API result. These annotations are far
     more reliable than regexing URLs out of prose, and they include sources the
@@ -179,7 +212,7 @@ def _collect_response_urls(response) -> list[str]:
         print(f"Annotation parse warning: {e}")
     return urls
 
-async def ask_openai(prompt: str, use_search: bool = False) -> str:
+async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -> str:
     """use_search=True runs the audit prompt with live web search (what a real
     user's ChatGPT query does). Utility calls (category lookup, prompt
     generation, recommendations) don't need search, so they skip it."""
@@ -205,7 +238,7 @@ async def ask_openai(prompt: str, use_search: bool = False) -> str:
         try:
             response = await openai_client.responses.create(
                 model=model,
-                tools=[{"type": "web_search"}],
+                tools=[search_tool(country)],
                 input=prompt,
                 max_output_tokens=MAX_ANSWER_TOKENS,
             )
@@ -281,8 +314,13 @@ PROMPT_TYPE_GUIDE = {
     ),
     "brand": (
         "Someone who already names a specific product in this category.\n"
-        "Examples: profound alternatives / is otterly worth it / "
-        "peec ai vs profound"
+        "ALWAYS pair the product name with a category word. Many product names "
+        "are also ordinary English words, and on its own the model answers about "
+        "the word instead of the product: 'profound alternatives' returns "
+        "synonyms for 'deeply thoughtful'. Write 'profound ai visibility "
+        "alternatives' instead.\n"
+        "Examples: otterly ai visibility review / peec ai vs profound analytics / "
+        "alternatives to profound brand tracking"
     ),
 }
 
@@ -312,17 +350,28 @@ def _is_junk_prompt(p: str) -> bool:
     return False
 
 
-def _build_generation_prompt(brand: str, category: str, counts: dict) -> str:
+def _build_generation_prompt(brand: str, category: str, counts: dict,
+                            competitors: list[str] | None = None,
+                            language: str = "English") -> str:
     blocks = []
     for name, n in counts.items():
         if n <= 0:
             continue
         blocks.append(f"{n} of type {name.upper()}:\n{PROMPT_TYPE_GUIDE[name]}")
+    rivals = ""
+    if competitors:
+        # Without the real names the model invents plausible-sounding rivals,
+        # and the brand-type prompts end up measuring companies that do not exist.
+        rivals = ("Real competitors in this market: " + ", ".join(competitors[:6]) +
+                  ". Use these names in BRAND queries, not invented ones.\n\n")
     return (
         f"Category: {category}\n\n"
+        + rivals +
         f"Write search queries real people type into ChatGPT about this category.\n\n"
         + "\n\n".join(blocks) +
         "\n\nRules:\n"
+        f"- Write every query in {language}. These are the words buyers in this "
+        f"market actually type.\n"
         "- 3 to 10 words each. Plain lowercase, how people actually type.\n"
         "- NEVER use placeholders like 'X vs Y' or brackets.\n"
         f"- Do not mention {brand}.\n"
@@ -371,14 +420,20 @@ def _fallback_prompts(category: str, total: int) -> list[dict]:
     return base[:total]
 
 
-async def generate_prompts(brand: str, category: str) -> list[dict]:
-    cache_key = category.strip().lower()
+async def generate_prompts(brand: str, category: str,
+                           competitors: list[str] | None = None,
+                           country: str = "US") -> list[dict]:
+    # Competitors change the brand-type prompts, so they belong in the key.
+    # Market changes both the language and the rivals, so it belongs in the key.
+    cache_key = "|".join([category.strip().lower(), (country or "US").upper(),
+                          ",".join(sorted(c.lower() for c in (competitors or [])))])
     if cache_key in PROMPT_CACHE:
         print(f"Prompt cache hit: {cache_key}")
         return PROMPT_CACHE[cache_key]
 
     counts = split_counts(PROMPT_COUNT)
-    response = await ask_openai(_build_generation_prompt(brand, category, counts))
+    language = market_language(country)
+    response = await ask_openai(_build_generation_prompt(brand, category, counts, competitors, language))
     prompts = _parse_generated(response, counts)
 
     if len(prompts) < 2:
@@ -419,7 +474,7 @@ async def run_audit(request: AuditRequest):
     brand_info = await enrich_brand(brand, description)
     category = brand_info.get("category", brand + " category")
     clean_brand = brand_info.get("clean_brand", brand)
-    prompt_specs = await generate_prompts(clean_brand, category)
+    prompt_specs = await generate_prompts(clean_brand, category, competitors, request.country)
     prompts = [p["text"] for p in prompt_specs]
     prompt_type_by_text = {p["text"]: p["type"] for p in prompt_specs}
 
@@ -438,7 +493,7 @@ async def run_audit(request: AuditRequest):
     async def run_prompt(prompt):
         gemini_answer, openai_answer = await asyncio.gather(
             ask_gemini(prompt),
-            ask_openai(prompt, use_search=True)
+            ask_openai(prompt, use_search=True, country=request.country)
         )
         return prompt, gemini_answer, openai_answer
 
@@ -585,6 +640,8 @@ Data: """ + summary)
         "brand": clean_brand,
         "category": category,
         "brand_domain": brand_domain,
+        "country": (request.country or "US").upper(),
+        "language": market_language(request.country),
         "run_at": datetime.now(timezone.utc).isoformat(),
         "models_used": {
             "chatgpt": OPENAI_SEARCH_MODEL,
@@ -630,11 +687,11 @@ async def clear_cache():
     return {"cleared": n}
 
 @app.get("/debug-prompt")
-async def debug_prompt(q: str = "best AI visibility tracking tools"):
+async def debug_prompt(q: str = "best AI visibility tracking tools", country: str = ""):
     try:
         response = await openai_client.responses.create(
             model=OPENAI_SEARCH_MODEL,
-            tools=[{"type": "web_search"}],
+            tools=[search_tool(country)],
             input=q,
             max_output_tokens=MAX_ANSWER_TOKENS,
         )
