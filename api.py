@@ -661,16 +661,23 @@ async def run_audit(request: AuditRequest):
     brand = request.brand
     # Both shapes collapse to: a list of names, plus domains where we know them.
     if request.competitor_list:
-        competitors = [c.name.strip() for c in request.competitor_list if c.name.strip()]
-        competitor_domains = {
-            c.name.strip(): extract_domain(
-                c.website if c.website.startswith("http") else "https://" + c.website
-            )
-            for c in request.competitor_list
-            if c.name.strip() and c.website.strip()
-        }
+        competitors = []
+        competitor_domains = {}
+        for c in request.competitor_list:
+            # People paste a comma-separated list into one field out of habit.
+            # Left as-is it becomes a single "brand" that appears in no answer,
+            # and every competitor silently scores zero.
+            names = [n.strip() for n in c.name.split(",") if n.strip()]
+            sites = [w.strip() for w in c.website.split(",") if w.strip()]
+            for i, n in enumerate(names):
+                competitors.append(n)
+                site = sites[i] if i < len(sites) else (sites[0] if len(sites) == 1 and len(names) == 1 else "")
+                if site:
+                    competitor_domains[n] = extract_domain(
+                        site if site.startswith("http") else "https://" + site)
     else:
-        competitors = request.competitors
+        competitors = [n.strip() for c in request.competitors
+                       for n in c.split(",") if n.strip()]
         competitor_domains = {}
     description = request.description
     website = request.website.strip()
