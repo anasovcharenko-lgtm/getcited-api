@@ -42,6 +42,9 @@ class AuditRequest(BaseModel):
     # Language is separate from country on purpose: a UK-targeted brand can
     # have a Russian-speaking audience, and one field cannot express that.
     language: str = ""
+    # When present, these run instead of generated ones. Not alongside: mixing
+    # them would make it unclear what was actually measured.
+    custom_prompts: list[str] = []
     # The market being sold INTO, not where the company sits. A US company
     # targeting the UK should be measured on UK results, in English.
     country: str = "US"
@@ -177,6 +180,8 @@ OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-luna")
 OPENAI_UTILITY_FALLBACKS = ["gpt-5-nano", "gpt-4.1-mini"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "20"))
+# Every prompt costs money, so hand-written lists get a ceiling too.
+MAX_CUSTOM_PROMPTS = int(os.getenv("MAX_CUSTOM_PROMPTS", "20"))
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
 GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
 
@@ -673,7 +678,8 @@ async def run_audit(request: AuditRequest):
     cache_key = "|".join([brand.strip().lower(),
                           ",".join(sorted(c.lower() for c in competitors)),
                           website.lower(), (request.country or "US").upper(),
-                          (request.language or "")])
+                          (request.language or ""),
+                          "|".join(sorted(p.strip() for p in request.custom_prompts))])
     cached = AUDIT_CACHE.get(cache_key)
     if cached and (asyncio.get_event_loop().time() - cached[0]) < AUDIT_CACHE_TTL:
         print(f"Audit cache hit: {cache_key}")
@@ -685,7 +691,17 @@ async def run_audit(request: AuditRequest):
     category = brand_info.get("category", brand + " category")
     clean_brand = brand_info.get("clean_brand", brand)
     language = (request.language or "").strip() or market_language(request.country)
-    prompt_specs = await generate_prompts(clean_brand, category, competitors, request.country, language)
+
+    custom = [p.strip() for p in request.custom_prompts if p.strip()][:MAX_CUSTOM_PROMPTS]
+    if custom:
+        # Hand-written prompts replace generation entirely. The point of choosing
+        # "manual" is to measure exactly these, so quietly topping them up with
+        # generated ones would defeat it.
+        print(f"  using {len(custom)} custom prompt(s), generation skipped")
+        prompt_specs = [{"text": p, "type": "custom"} for p in custom]
+    else:
+        prompt_specs = await generate_prompts(clean_brand, category, competitors,
+                                              request.country, language)
     prompts = [p["text"] for p in prompt_specs]
     prompt_type_by_text = {p["text"]: p["type"] for p in prompt_specs}
 
