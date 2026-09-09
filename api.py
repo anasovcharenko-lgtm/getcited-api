@@ -214,205 +214,12 @@ def market_language(country: str) -> str:
     return MARKET_LANGUAGES.get((country or "US").upper(), "English")
 
 
-MODEL_ERRORS: dict[str, str] = {}
-
-# gpt-4o-search-preview was shut down on 2026-07-23. Web search now runs through
-# the Responses API web_search tool on a standard model. Override with env vars
-# if these names change again.
-OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-5.6-luna")
-OPENAI_SEARCH_FALLBACKS = ["gpt-5.6-terra", "gpt-5.6", "gpt-4.1"]
-OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-luna")
-OPENAI_UTILITY_FALLBACKS = ["gpt-5-nano", "gpt-4.1-mini"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "20"))
 # Every prompt costs money, so hand-written lists get a ceiling too.
 MAX_CUSTOM_PROMPTS = int(os.getenv("MAX_CUSTOM_PROMPTS", "20"))
+# Cap answer length. NOTE: on reasoning models this budget also covers internal
+# reasoning tokens, so setting it too low returns an EMPTY answer with no error.
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
-GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
-
-async def ask_gemini(prompt: str) -> str:
-    if not GEMINI_ENABLED:
-        MODEL_ERRORS["gemini"] = "disabled"
-        return ""
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"tools": [{"google_search": {}}]}
-        )
-        text = response.text or ""
-        print(f"Gemini OK: {len(text)} chars")
-        return text
-    except Exception as e:
-        print(f"Gemini error: {e}")
-        MODEL_ERRORS["gemini"] = str(e)[:300]
-        return ""
-
-def search_tool(country: str = "") -> dict:
-    """Web search results are location-influenced, so the same query returns
-    different sources in London and Moscow. Without this the audit measures
-    whatever market OpenAI defaults to, not the client's."""
-    tool: dict = {"type": "web_search"}
-    if country:
-        tool["user_location"] = {"type": "approximate", "country": country.upper()}
-    return tool
-
-
-def _collect_response_urls(response) -> list[str]:
-    """Pull cited URLs out of a Responses API result. These annotations are far
-    more reliable than regexing URLs out of prose, and they include sources the
-    model consulted but didn't render as a visible link."""
-    urls: list[str] = []
-    try:
-        for item in getattr(response, "output", []) or []:
-            for content in getattr(item, "content", []) or []:
-                for ann in getattr(content, "annotations", []) or []:
-                    url = getattr(ann, "url", None)
-                    if url:
-                        urls.append(url)
-    except Exception as e:
-        print(f"Annotation parse warning: {e}")
-    return urls
-
-async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -> str:
-    """use_search=True runs the audit prompt with live web search (what a real
-    user's ChatGPT query does). Utility calls (category lookup, prompt
-    generation, recommendations) don't need search, so they skip it."""
-    if not use_search:
-        last_error = None
-        for model in [OPENAI_UTILITY_MODEL] + OPENAI_UTILITY_FALLBACKS:
-            try:
-                response = await openai_client.responses.create(
-                    model=model,
-                    input=prompt,
-                    max_output_tokens=MAX_ANSWER_TOKENS,
-                )
-                return response.output_text or ""
-            except Exception as e:
-                last_error = e
-                print(f"OpenAI utility error on {model}: {e}")
-                continue
-        MODEL_ERRORS["chatgpt"] = str(last_error)[:300]
-        return ""
-
-    last_error = None
-    for model in [OPENAI_SEARCH_MODEL] + OPENAI_SEARCH_FALLBACKS:
-        try:
-            response = await openai_client.responses.create(
-                model=model,
-                tools=[search_tool(country)],
-                input=prompt,
-                max_output_tokens=MAX_ANSWER_TOKENS,
-            )
-            text = response.output_text or ""
-            # Append cited URLs so downstream link extraction sees every source,
-            # not just the ones the model happened to inline in the prose.
-            urls = _collect_response_urls(response)
-            if urls:
-                text += "\n\nSources: " + " ".join(dict.fromkeys(urls))
-            print(f"OpenAI OK ({model}): {len(text)} chars, {len(urls)} cited urls")
-            MODEL_ERRORS.pop("chatgpt", None)
-            return text
-        except Exception as e:
-            last_error = e
-            print(f"OpenAI error on {model}: {e}")
-            continue
-
-    MODEL_ERRORS["chatgpt"] = str(last_error)[:300]
-    return ""
-
-async def enrich_brand(brand: str, description: str = "") -> dict:
-    clean_brand = brand
-    if brand.startswith('http'):
-        clean_brand = extract_brand_from_url(brand)
-
-    if description:
-        context = "Brand: " + clean_brand + "\nDescription: " + description
-    elif brand.startswith('http'):
-        context = "What company or product is at this website: " + brand + "\nBrand name extracted: " + clean_brand + "\n\nSearch your knowledge to identify what this company does. What is their specific product category?"
-    else:
-        context = "Brand: " + clean_brand
-
-    response = await ask_openai(context + """
-
-Identify the exact product category buyers would search for. Be narrow and concrete:
-name the market this product actually competes in, not a broader adjacent one.
-For example "AI search visibility tracking (GEO)" is a different market from
-"social media monitoring" - do not substitute one for the other.
-
-Answer in JSON only, no other text:
-{"category": "narrow buyer-facing category, 2-5 words", "known": true or false, "clean_name": "the brand name as commonly known"}""")
-
-    try:
-        import json
-        clean = response.strip().replace("```json", "").replace("```", "").strip()
-        data = json.loads(clean)
-        data['original_brand'] = brand
-        data['clean_brand'] = data.get('clean_name', clean_brand)
-        return data
-    except Exception:
-        return {"category": description or clean_brand + " category", "known": False, "original_brand": brand, "clean_brand": clean_brand}
-
-PROMPT_CACHE: dict[str, list[dict]] = {}
-
-# What the audit asks, and in what proportion. Only 'brand' style queries were
-# being generated before, which is why the audit kept surfacing vendor docs
-# instead of independent write-ups.
-# Six kinds of query, and how many of each. Weighted towards comparison
-# because that is where a buyer is actively choosing between vendors.
-PROMPT_MIX = [
-    ("comparison", 0.25),   # vs competitors - the block that decides deals
-    ("commercial", 0.20),   # ready to buy, evaluating options
-    ("problem",    0.20),   # has the problem, does not know the category
-    ("brand",      0.15),   # own brand recognition
-    ("vertical",   0.12),   # specific industries this product serves
-    ("technical",  0.08),   # IT buyers: integration, load, API
-]
-
-PROMPT_TYPE_GUIDE = {
-    "commercial": (
-        "Someone ready to buy, evaluating options in this category. They know "
-        "what they need and are looking for a supplier.\n"
-        "Shapes: best X for Y / X for [business type] / how much does X cost / "
-        "which X to choose for [segment]"
-    ),
-    "comparison": (
-        "Someone weighing named vendors against each other, or looking for an "
-        "alternative to one.\n"
-        "Only write queries where a DIFFERENT product could legitimately appear "
-        "in the answer: alternatives, comparisons, 'or', 'vs'.\n"
-        "NEVER write review or pricing queries about a COMPETITOR "
-        "('Mindbox reviews', 'Mindbox pricing') - nobody else can appear in "
-        "those, so they measure nothing.\n"
-        "ALWAYS pair a product name with a category word: many product names are "
-        "also ordinary words, and alone the model answers about the word.\n"
-        "Shapes: A vs B / alternatives to A / A or B, which is better for Y / "
-        "compare A, B and C for Y"
-    ),
-    "problem": (
-        "Someone with the problem who does not know this category of product "
-        "exists. They describe the symptom, not the solution.\n"
-        "Shapes: how do I [outcome] / why does [problem] happen / "
-        "how to start with [goal] / what is [concept] and why does it matter"
-    ),
-    "brand": (
-        "Someone checking on THIS brand specifically - awareness and reputation.\n"
-        "This is the one type where naming the audited brand is correct.\n"
-        "Shapes: what is [brand] / [brand] reviews / who uses [brand] / "
-        "[brand] case studies"
-    ),
-    "vertical": (
-        "Someone in a specific industry looking for this product for their own "
-        "sector. Infer plausible sectors from the category.\n"
-        "Shapes: X for [industry] / X for [type of shop or business]"
-    ),
-    "technical": (
-        "A technical buyer - IT director, integrator - asking about integration, "
-        "load, deployment or APIs.\n"
-        "Shapes: X with open API for [system] / how long does X take to deploy / "
-        "does X work offline / can X handle peak load"
-    ),
-}
 
 MODEL_ERRORS: dict[str, str] = {}
 
@@ -702,6 +509,50 @@ AUDIT_CACHE: dict = {}
 AUDIT_CACHE_TTL = int(os.getenv("AUDIT_CACHE_TTL", "3600"))
 
 @app.post("/audit")
+async def discover_brands(results: list[dict], known: list[str], category: str) -> list[str]:
+    """Product names the models mentioned that nobody asked us to look for.
+
+    Run once over all answers rather than once per prompt: the extra call costs
+    about half a cent, twenty would not be worth it. These are often the more
+    useful finding - a rival the client did not know they had.
+    """
+    blob = "\n\n".join(
+        (r["chatgpt"].get("answer") or "")[:1200] for r in results
+    )[:14000]
+    if not blob.strip():
+        return []
+
+    prompt = (
+        f"Below are AI answers about: {category}.\n\n"
+        "List the product, tool or company names that are recommended or compared "
+        "in them. One per line, nothing else.\n"
+        "Rules:\n"
+        "- Real product names only. Not generic terms like 'CRM' or 'loyalty program'.\n"
+        "- Write each name exactly as it appears in the text.\n"
+        "- If there are none, reply NONE.\n\n"
+        f"Answers:\n{blob}"
+    )
+    try:
+        raw = await ask_openai(prompt)
+    except Exception as exc:
+        print(f"  brand discovery failed: {type(exc).__name__}")
+        return []
+
+    known_flat = {_strip_separators(k)[0] for k in known if k}
+    found, seen = [], set()
+    for line in (raw or "").split("\n"):
+        name = line.strip().lstrip("-*0123456789. ").strip()
+        if not name or name.upper() == "NONE" or len(name) > 40:
+            continue
+        flat = _strip_separators(name)[0]
+        # Already tracked, or already found under a different spelling.
+        if not flat or flat in known_flat or flat in seen:
+            continue
+        seen.add(flat)
+        found.append(name)
+    return found[:12]
+
+
 async def run_audit(request: AuditRequest):
     brand = request.brand
     # Both shapes collapse to: a list of names, plus domains where we know them.
@@ -903,6 +754,20 @@ async def run_audit(request: AuditRequest):
     for i, stat in enumerate(competitor_stats):
         stat["rank"] = i + 1
 
+    discovered = await discover_brands(results, competitors + [clean_brand], category)
+    if discovered:
+        print(f"  discovered {len(discovered)} brand(s) nobody asked about: {', '.join(discovered)}")
+        for r in results:
+            for model_key in ("chatgpt", "gemini"):
+                answer = r[model_key].get("answer") or ""
+                r[model_key]["discovered_brands"] = [
+                    d for d in discovered if brand_in_text(answer, d)
+                ]
+    else:
+        for r in results:
+            for model_key in ("chatgpt", "gemini"):
+                r[model_key]["discovered_brands"] = []
+
     citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:10]
     summary = "Brand: " + clean_brand + ", Category: " + category + ", Score: " + str(visibility_score) + "%"
 
@@ -941,6 +806,7 @@ Data: """ + summary)
         "results": results,
         "competitor_ranking": competitor_stats,
         "citations": citations,
+        "discovered_brands": discovered,
         "sample_quote": sample_quote,
         "recommendations": rec_response,
         "debug": {
