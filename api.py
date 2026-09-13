@@ -508,7 +508,6 @@ async def check_brand(request: dict):
 AUDIT_CACHE: dict = {}
 AUDIT_CACHE_TTL = int(os.getenv("AUDIT_CACHE_TTL", "3600"))
 
-@app.post("/audit")
 async def discover_brands(results: list[dict], known: list[str], category: str) -> list[str]:
     """Product names the models mentioned that nobody asked us to look for.
 
@@ -553,6 +552,7 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
     return found[:12]
 
 
+@app.post("/audit")
 async def run_audit(request: AuditRequest):
     brand = request.brand
     # Both shapes collapse to: a list of names, plus domains where we know them.
