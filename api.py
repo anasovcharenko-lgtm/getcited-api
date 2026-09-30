@@ -176,23 +176,40 @@ def find_mention_sentence(text: str, brand: str) -> str:
             return s if len(s) <= 240 else s[:237] + "..."
     return ""
 
-async def get_site_context(url: str) -> str:
+async def fetch_site_text(url: str) -> tuple[str, str]:
+    """Return (text, reason). Exactly one is non-empty.
+
+    The old version read only <title> and a meta tag, which for a small brand is
+    often just the brand name again - enough to identify nothing. Reading the
+    page body is what actually reveals what the company sells.
+    """
+    if not url:
+        return "", "no website given"
+    if not url.startswith("http"):
+        url = "https://" + url
+
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            text = resp.text[:3000]
-            title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
-            desc_match = re.search(r'content="([^"]{20,200})"', text)
-            result = []
-            if title_match:
-                result.append("Title: " + title_match.group(1).strip())
-            if desc_match:
-                result.append("Description: " + desc_match.group(1).strip())
-            return " | ".join(result)
-    except Exception as e:
-        print(f"Scrape error: {e}")
-        return ""
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": SOURCE_BROWSER_UA})
+    except Exception as exc:
+        return "", f"could not reach the site ({type(exc).__name__})"
+
+    if r.status_code != 200:
+        return "", f"the site returned {r.status_code}"
+
+    parser = _PageText()
+    try:
+        parser.feed(r.text)
+    except Exception:
+        return "", "the page markup could not be parsed"
+
+    text = parser.text()
+    if len(text) < 200:
+        return "", ("the page has almost no readable text - it is most likely "
+                    "rendered by JavaScript")
+    return text[:6000], ""
+
 
 # Which language buyers in this market actually type. Prompts generated in the
 # wrong language measure a market the client does not sell in.
@@ -325,17 +342,38 @@ async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -
     MODEL_ERRORS["chatgpt"] = str(last_error)[:300]
     return ""
 
-async def enrich_brand(brand: str, description: str = "") -> dict:
+async def enrich_brand(brand: str, description: str = "", website: str = "") -> dict:
+    """Work out which market this brand competes in.
+
+    Order matters: the site is the most reliable source, a typed description
+    next, the model's own recall last. Asking the model to recall a small brand
+    it has never seen is how categories came back as "Unknown".
+    """
     clean_brand = brand
-    if brand.startswith('http'):
+    if brand.startswith("http"):
         clean_brand = extract_brand_from_url(brand)
 
-    if description:
-        context = "Brand: " + clean_brand + "\nDescription: " + description
-    elif brand.startswith('http'):
-        context = "What company or product is at this website: " + brand + "\nBrand name extracted: " + clean_brand + "\n\nSearch your knowledge to identify what this company does. What is their specific product category?"
+    site_url = website or (brand if brand.startswith("http") else "")
+    site_text, site_reason = await fetch_site_text(site_url)
+
+    if site_text:
+        source = "site"
+        context = (f"Brand: {clean_brand}\n"
+                   f"Text from their website:\n{site_text}")
+        if description:
+            context += f"\n\nWhat the owner says they do: {description}"
+    elif description:
+        source = "description"
+        context = f"Brand: {clean_brand}\nDescription: {description}"
+        if site_reason:
+            print(f"  site not readable: {site_reason}")
     else:
-        context = "Brand: " + clean_brand
+        source = "model_knowledge"
+        if site_reason:
+            print(f"  site not readable: {site_reason}")
+        context = (f"Brand: {clean_brand}\n"
+                   "Identify this company from your own knowledge. If you do not "
+                   'recognise it, set known to false and category to "Unknown".')
 
     response = await ask_openai(context + """
 
@@ -351,17 +389,87 @@ Answer in JSON only, no other text:
         import json
         clean = response.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(clean)
-        data['original_brand'] = brand
-        data['clean_brand'] = data.get('clean_name', clean_brand)
+        data["original_brand"] = brand
+        data["clean_brand"] = data.get("clean_name", clean_brand)
+        data["category_source"] = source
+        # A category we could not actually determine should say so rather than
+        # quietly becoming a guess the prompts are then built on.
+        if not data.get("category") or data["category"].lower() in ("unknown", "n/a"):
+            data["category"] = "Unknown"
+            data["needs_description"] = source != "description"
+            data["site_issue"] = site_reason
         return data
     except Exception:
-        return {"category": description or clean_brand + " category", "known": False, "original_brand": brand, "clean_brand": clean_brand}
+        return {"category": description or "Unknown",
+                "known": False,
+                "original_brand": brand,
+                "clean_brand": clean_brand,
+                "category_source": source,
+                "needs_description": not description,
+                "site_issue": site_reason}
+
 
 PROMPT_CACHE: dict[str, list[dict]] = {}
 
 # What the audit asks, and in what proportion. Only 'brand' style queries were
 # being generated before, which is why the audit kept surfacing vendor docs
 # instead of independent write-ups.
+
+
+# The six kinds of query the audit asks, and in what proportion. Weights must
+# add up to 1.0, and the LAST entry absorbs the rounding in split_counts(), so
+# the smallest share goes last. At PROMPT_COUNT=20 this gives 5/4/4/3/2/2.
+PROMPT_MIX = [
+    ("comparison", 0.25),
+    ("commercial", 0.20),
+    ("problem",    0.20),
+    ("brand",      0.15),
+    ("vertical",   0.12),
+    ("technical",  0.08),
+]
+
+# One entry per PROMPT_MIX key — _build_generation_prompt() indexes this
+# directly, so a missing key is a KeyError at request time, not at import.
+PROMPT_TYPE_GUIDE = {
+    "comparison": (
+        "Someone who knows the category and is weighing options against each other.\n"
+        "Examples: best ai visibility tracking tools / "
+        "ai visibility tools compared / "
+        "cheapest way to monitor brand mentions in ai"
+    ),
+    "commercial": (
+        "Someone ready to buy, asking about price, plans or how to start.\n"
+        "Examples: how much does ai visibility tracking cost / "
+        "ai brand monitoring free trial / "
+        "is there a cheap ai visibility tool"
+    ),
+    "problem": (
+        "Someone with the symptom who does not know this category of tool exists. "
+        "They describe what is wrong, not what to buy.\n"
+        "Examples: why does my brand not show up in chatgpt / "
+        "how do i know what ai says about my company / "
+        "my competitors appear in ai answers and i don't"
+    ),
+    "brand": (
+        "Someone who already names a specific product in this category.\n"
+        "Examples: profound alternatives / is otterly worth it / "
+        "peec ai vs profound"
+    ),
+    "vertical": (
+        "Someone asking about this category for a specific industry, company size "
+        "or role.\n"
+        "Examples: ai visibility tracking for ecommerce / "
+        "brand monitoring for small agencies / "
+        "ai seo tools for saas startups"
+    ),
+    "technical": (
+        "Someone asking how it works or how it fits their stack — integrations, "
+        "APIs, data, setup.\n"
+        "Examples: ai visibility tool with api / "
+        "how to track llm mentions programmatically / "
+        "export ai search data to looker"
+    ),
+}
 
 
 def split_counts(total: int) -> dict:
@@ -590,8 +698,10 @@ async def run_audit(request: AuditRequest):
 
     MODEL_ERRORS.clear()
 
-    brand_info = await enrich_brand(brand, description)
-    category = brand_info.get("category", brand + " category")
+    brand_info = await enrich_brand(brand, description, website)
+    # An undetermined category should not silently become "<brand> category":
+    # prompts built on a made-up market measure nothing.
+    category = brand_info.get("category") or "Unknown"
     clean_brand = brand_info.get("clean_brand", brand)
     language = (request.language or "").strip() or market_language(request.country)
 
@@ -786,6 +896,9 @@ Data: """ + summary)
         "brand": clean_brand,
         "category": category,
         "brand_domain": brand_domain,
+        "category_source": brand_info.get("category_source", ""),
+        "needs_description": brand_info.get("needs_description", False),
+        "site_issue": brand_info.get("site_issue", ""),
         "country": (request.country or "US").upper(),
         "language": language,
         "run_at": datetime.now(timezone.utc).isoformat(),
