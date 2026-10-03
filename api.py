@@ -853,6 +853,10 @@ async def run_audit(request: AuditRequest):
         competitor_stats.append({
             "name": search_b,
             "is_your_brand": is_you,
+            # Carried through so the page check can compare this brand's page
+            # with the pages of the rivals that actually get named. Without it
+            # the comparison would have to ask the user to retype the URLs.
+            "domain": (brand_domain if is_you else competitor_domains.get(search_b, "")),
             "gemini_mentions": g,
             "chatgpt_mentions": c,
             "total_mentions": g + c,
