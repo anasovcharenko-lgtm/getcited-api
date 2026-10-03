@@ -1303,6 +1303,11 @@ def check_self_declaration(place: dict, rivals: list[dict], brand: str,
     return {
         "id": "self_declaration",
         "severity": "high",
+        # The facts the wording was derived from. A client renders its own
+        # sentence from these; the English below is a fallback, not the source
+        # of truth, so a Russian interface does not end up showing English.
+        "facts": {"term": term, "body_occurrences": place["body_occurrences"],
+                  "missing": missing},
         "title": "The page does not declare the category it competes in",
         "found": (f"'{term}' appears {place['body_occurrences']} time(s) in the body, "
                   f"but not in the {', '.join(missing)}."),
@@ -1340,6 +1345,9 @@ def check_question_content(facts: _PageFacts, rivals: list[dict],
     return {
         "id": "question_content",
         "severity": "high" if not own_questions else "medium",
+        "facts": {"own_questions": len(own_questions),
+                  "has_faq_schema": facts.has_faq_schema(),
+                  "lost_questions": len(asked)},
         "title": "No question-shaped content for the questions you are losing",
         "found": (f"{len(own_questions)} heading(s) on the page are phrased as a question"
                   + ("" if facts.has_faq_schema() else ", and there is no FAQPage markup")
@@ -1379,6 +1387,9 @@ def check_ai_crawlers(parsed: dict, path: str, rivals: list[dict]) -> dict | Non
     return {
         "id": "ai_crawlers",
         "severity": "high" if blocked else "low",
+        "facts": {"blocked": blocked, "unnamed": len(unnamed),
+                  "total_agents": len(AI_CRAWLER_FLAT),
+                  "has_sitemap": bool(parsed.get("sitemaps"))},
         "title": ("AI crawlers are blocked from this page" if blocked
                   else ("No robots.txt rules name the AI crawlers" if len(unnamed) == len(AI_CRAWLER_FLAT)
                         else "Some AI crawlers have no rules of their own")),
@@ -1406,6 +1417,7 @@ def check_js_rendered(facts: _PageFacts) -> dict | None:
     return {
         "id": "js_rendered",
         "severity": "high",
+        "facts": {"body_chars": len(body)},
         "title": "The page has almost no text until JavaScript runs",
         "found": f"Only {len(body)} characters of text are present in the HTML itself.",
         "why": ("Most crawlers that feed assistants do not run JavaScript, so they see an "
