@@ -49,6 +49,11 @@ class AuditRequest(BaseModel):
     # targeting the UK should be measured on UK results, in English.
     country: str = "US"
     website: str = ""
+    # How well known the brand is: "large", "mid" or "small". It decides how the
+    # queries split between broad and long-tail, because a mid-size brand cannot
+    # place in a broad comparison however good its site is. Blank falls back to
+    # DEFAULT_BRAND_SIZE, so an older client that omits it keeps working.
+    brand_size: str = ""
 
 def extract_urls(text: str) -> list[str]:
     pattern = r'https?://[^\s\)\]\,\"\'<>]+'
@@ -428,6 +433,63 @@ PROMPT_MIX = [
     ("technical",  0.08),
 ]
 
+# How those weights change with how well known the brand is.
+#
+# The weights are not cosmetic. In a broad comparison query the model answers
+# with the most frequently written-about names, so a brand nobody writes about
+# cannot appear there however good its site is. In a narrow query frequency
+# stops helping, because almost nobody has written about the narrow thing — so
+# whoever has the matching text wins. Measuring a mid-size brand mostly on
+# broad comparisons therefore spends the audit on ground it cannot take.
+#
+# 'brand' rises as the brand gets smaller: for an unknown company the useful
+# question is whether the model knows it at all, not where it places. 'problem'
+# is flat at 20% everywhere — symptom-shaped queries do not care about size.
+#
+# Same key order in all three, so the same type always absorbs the rounding.
+PROMPT_MIXES: dict[str, list[tuple[str, float]]] = {
+    # Broad queries are winnable, so they keep real weight. This is PROMPT_MIX.
+    "large": PROMPT_MIX,
+    # Mid-size with little or no SEO: the model knows the brand but never
+    # recalls it unprompted. Weight moves to the long tail.
+    "mid": [
+        ("comparison", 0.10),
+        ("commercial", 0.15),
+        ("problem",    0.20),
+        ("brand",      0.15),
+        ("vertical",   0.25),
+        ("technical",  0.15),
+    ],
+    # Small or new: broad comparisons are close to unwinnable, so they get the
+    # minimum, and the priority is establishing whether the model knows anything.
+    "small": [
+        ("comparison", 0.05),
+        ("commercial", 0.10),
+        ("problem",    0.20),
+        ("brand",      0.20),
+        ("vertical",   0.30),
+        ("technical",  0.15),
+    ],
+}
+
+# An audit that does not say the size gets this. Most brands buying visibility
+# measurement are mid-size without SEO, and of the three profiles 'mid' is the
+# least wrong in either direction.
+DEFAULT_BRAND_SIZE = "mid"
+
+
+def resolve_mix(size: str | None) -> list[tuple[str, float]]:
+    """Pick a mix by size, tolerating whatever the client sends."""
+    key = (size or "").strip().lower()
+    key = {
+        "big": "large", "enterprise": "large", "known": "large", "well-known": "large",
+        "medium": "mid", "mid-size": "mid", "midsize": "mid",
+        "startup": "small", "new": "small",
+        "unknown": DEFAULT_BRAND_SIZE, "": DEFAULT_BRAND_SIZE,
+    }.get(key, key)
+    return PROMPT_MIXES.get(key, PROMPT_MIXES[DEFAULT_BRAND_SIZE])
+
+
 # One entry per PROMPT_MIX key — _build_generation_prompt() indexes this
 # directly, so a missing key is a KeyError at request time, not at import.
 PROMPT_TYPE_GUIDE = {
@@ -472,19 +534,20 @@ PROMPT_TYPE_GUIDE = {
 }
 
 
-def split_counts(total: int) -> dict:
+def split_counts(total: int, size: str | None = None) -> dict:
     """Turn the mix into whole numbers that add up to `total` exactly."""
+    mix = resolve_mix(size)
     counts = {}
     assigned = 0
-    for i, (name, share) in enumerate(PROMPT_MIX):
-        if i == len(PROMPT_MIX) - 1:
+    for i, (name, share) in enumerate(mix):
+        if i == len(mix) - 1:
             counts[name] = total - assigned      # last one absorbs the rounding
         else:
-            n = max(1, round(total * share)) if total >= len(PROMPT_MIX) else 0
+            n = max(1, round(total * share)) if total >= len(mix) else 0
             counts[name] = n
             assigned += n
-    if counts[PROMPT_MIX[-1][0]] < 0:
-        counts[PROMPT_MIX[-1][0]] = 0
+    if counts[mix[-1][0]] < 0:
+        counts[mix[-1][0]] = 0
     return counts
 
 
@@ -580,19 +643,25 @@ def _fallback_prompts(category: str, total: int) -> list[dict]:
 async def generate_prompts(brand: str, category: str,
                            competitors: list[str] | None = None,
                            country: str = "US",
-                           language: str = "") -> list[dict]:
+                           language: str = "",
+                           brand_size: str = "") -> list[dict]:
     # Competitors change the brand-type prompts, so they belong in the key.
     # Market changes both the language and the rivals, so it belongs in the key.
     language = language or market_language(country)
     # Language is in the key as well as country: same market, different audience
     # language means different prompts.
+    # Size belongs in the key too. Two brands in the same category at different
+    # sizes get different mixes, and without this the first one audited would
+    # serve its prompts to the second from cache.
+    size_key = (brand_size or DEFAULT_BRAND_SIZE).strip().lower()
     cache_key = "|".join([category.strip().lower(), (country or "US").upper(), language,
+                          size_key,
                           ",".join(sorted(c.lower() for c in (competitors or [])))])
     if cache_key in PROMPT_CACHE:
         print(f"Prompt cache hit: {cache_key}")
         return PROMPT_CACHE[cache_key]
 
-    counts = split_counts(PROMPT_COUNT)
+    counts = split_counts(PROMPT_COUNT, brand_size)
     response = await ask_openai(_build_generation_prompt(brand, category, counts, competitors, language))
     prompts = _parse_generated(response, counts)
 
@@ -603,7 +672,7 @@ async def generate_prompts(brand: str, category: str,
     by_type = {}
     for p in prompts:
         by_type[p["type"]] = by_type.get(p["type"], 0) + 1
-    print(f"  prompts by type: {by_type}")
+    print(f"  prompts by type ({size_key}): {by_type}")
 
     PROMPT_CACHE[cache_key] = prompts
     return prompts
@@ -690,6 +759,9 @@ async def run_audit(request: AuditRequest):
                           ",".join(sorted(c.lower() for c in competitors)),
                           website.lower(), (request.country or "US").upper(),
                           (request.language or ""),
+                          # Size changes which prompts run, so the same brand at
+                          # two sizes is two different audits.
+                          (request.brand_size or "").strip().lower(),
                           "|".join(sorted(p.strip() for p in request.custom_prompts))])
     cached = AUDIT_CACHE.get(cache_key)
     if cached and (asyncio.get_event_loop().time() - cached[0]) < AUDIT_CACHE_TTL:
@@ -714,7 +786,8 @@ async def run_audit(request: AuditRequest):
         prompt_specs = [{"text": p, "type": "custom"} for p in custom]
     else:
         prompt_specs = await generate_prompts(clean_brand, category, competitors,
-                                              request.country, language)
+                                              request.country, language,
+                                              request.brand_size)
     prompts = [p["text"] for p in prompt_specs]
     prompt_type_by_text = {p["text"]: p["type"] for p in prompt_specs}
 
