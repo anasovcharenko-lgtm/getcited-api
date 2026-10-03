@@ -1027,6 +1027,519 @@ def _reason_for_status(code: int) -> str:
     return f"unexpected response ({code})"
 
 
+# ─────────────────────────────────────────────────────────────
+# Page check: why the models do not name you, and what to change
+#
+# The visibility audit answers "are we named". This answers "why not", by
+# reading the page the way a retrieval system reads it and comparing it with
+# the pages of competitors the audit found ARE named.
+#
+# Everything here except the fetching is a pure function, so it can be tested
+# on fixtures instead of on live sites.
+# ─────────────────────────────────────────────────────────────
+
+PAGE_CHECK_TIMEOUT = 12.0
+
+# The crawlers that actually matter for being named in an assistant's answer.
+# Grouped by who operates them, because a robots.txt fix is written per group.
+AI_CRAWLERS = {
+    "OpenAI": ["GPTBot", "OAI-SearchBot", "ChatGPT-User"],
+    "Anthropic": ["ClaudeBot", "Claude-Web", "Claude-User", "Claude-SearchBot", "anthropic-ai"],
+    "Perplexity": ["PerplexityBot", "Perplexity-User"],
+    "Google": ["Google-Extended"],
+    "Common Crawl": ["CCBot"],
+}
+AI_CRAWLER_FLAT = [a for group in AI_CRAWLERS.values() for a in group]
+
+
+class _PageFacts(HTMLParser):
+    """Everything about a page that affects whether it gets retrieved.
+
+    Deliberately not just the text: where a phrase sits matters far more than
+    how often it occurs, and that is exactly what the text alone cannot show.
+    """
+
+    SKIP = {"script", "style", "noscript", "svg"}
+    HEADINGS = {"h1", "h2", "h3"}
+
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self.meta_description = ""
+        self.meta_robots = ""
+        self.headings: list[tuple[str, str]] = []     # (tag, text)
+        self.jsonld: list[str] = []
+        self.body_parts: list[str] = []
+        self._skip = 0
+        self._capture = None                          # "title" | "h1".. | "jsonld"
+        self._buf: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "meta":
+            name = a.get("name", "").lower()
+            if name == "description" and not self.meta_description:
+                self.meta_description = a.get("content", "").strip()
+            elif name == "robots":
+                self.meta_robots = a.get("content", "").strip().lower()
+        elif tag == "script":
+            if a.get("type", "").lower() == "application/ld+json":
+                self._capture, self._buf = "jsonld", []
+                return                                # capture, do not skip
+            self._skip += 1
+        elif tag in self.SKIP:
+            self._skip += 1
+        elif tag == "title":
+            self._capture, self._buf = "title", []
+        elif tag in self.HEADINGS:
+            self._capture, self._buf = tag, []
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self._capture == "jsonld":
+            self.jsonld.append("".join(self._buf).strip())
+            self._capture, self._buf = None, []
+            return
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+            return
+        if self._capture == tag or (tag == "title" and self._capture == "title"):
+            text = " ".join(" ".join(self._buf).split())
+            if tag == "title":
+                self.title = text
+            elif text:
+                self.headings.append((tag, text))
+            self._capture, self._buf = None, []
+
+    def handle_data(self, data):
+        if self._capture:
+            self._buf.append(data)
+        if not self._skip:
+            t = data.strip()
+            if t:
+                self.body_parts.append(t)
+
+    # ── derived ──
+    def body_text(self) -> str:
+        return " ".join(self.body_parts)
+
+    def h1(self) -> str:
+        return next((t for tag, t in self.headings if tag == "h1"), "")
+
+    def questions(self) -> list[str]:
+        return [t for _, t in self.headings if t.rstrip().endswith("?")]
+
+    def has_faq_schema(self) -> bool:
+        return any("faqpage" in b.lower() for b in self.jsonld)
+
+    def schema_types(self) -> list[str]:
+        found = []
+        for block in self.jsonld:
+            for m in re.finditer(r'"@type"\s*:\s*"([^"]+)"', block):
+                if m.group(1) not in found:
+                    found.append(m.group(1))
+        return found
+
+
+def _stem(word: str) -> str:
+    """Crude stem so Russian cases match: программа / программы / программу.
+
+    A real morphological analyser would be better, but it is a dependency and a
+    deployment risk for a gain that does not change any verdict here — the
+    endings we need to survive are two or three characters long.
+    """
+    w = word.lower().strip("«»\"'.,:;!?()[]")
+    if len(w) <= 4:
+        return w
+    return w[:-2] if len(w) <= 7 else w[:-3]
+
+
+def term_pattern(term: str) -> re.Pattern:
+    """Match a multi-word term across inflections and a little word order slack."""
+    stems = [re.escape(_stem(w)) for w in term.split() if w.strip()]
+    if not stems:
+        return re.compile(r"(?!)")                    # matches nothing
+    return re.compile(r"\w*".join(f"{s}\\w*" for s in stems).replace(r"\w*\w*", r"\w*[\s\-]*"),
+                      re.IGNORECASE | re.UNICODE)
+
+
+def term_placement(facts: _PageFacts, terms: list[str]) -> dict:
+    """Where the category term sits, which is what decides retrieval.
+
+    Frequency is recorded but deliberately not scored: a page can name the
+    category forty times in its case studies and still declare itself to be
+    something else in the only three places that are read as a declaration.
+    """
+    pats = [(t, term_pattern(t)) for t in terms if t.strip()]
+    body = facts.body_text()
+    hit = lambda s: any(p.search(s or "") for _, p in pats)
+    return {
+        "in_title": hit(facts.title),
+        "in_h1": hit(facts.h1()),
+        "in_meta_description": hit(facts.meta_description),
+        "in_any_heading": any(hit(t) for _, t in facts.headings),
+        "body_occurrences": sum(len(p.findall(body)) for _, p in pats),
+        "title": facts.title,
+        "h1": facts.h1(),
+        "meta_description": facts.meta_description,
+    }
+
+
+# ── robots.txt ──
+
+def parse_robots(text: str) -> dict:
+    """{'agents': {ua_lower: [(allow|disallow, path)]}, 'sitemaps': [...]}"""
+    agents: dict[str, list[tuple[str, str]]] = {}
+    sitemaps: list[str] = []
+    current: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        field, _, value = line.partition(":")
+        field, value = field.strip().lower(), value.strip()
+        if field == "user-agent":
+            # Consecutive User-agent lines share one group of rules.
+            if current and agents.get(current[-1]):
+                current = []
+            current.append(value.lower())
+            agents.setdefault(value.lower(), [])
+        elif field in ("allow", "disallow") and current:
+            for ua in current:
+                agents[ua].append((field, value))
+        elif field == "sitemap":
+            sitemaps.append(value)
+    return {"agents": agents, "sitemaps": sitemaps}
+
+
+def _robots_path_match(rule: str, path: str) -> int:
+    """Length of the matched prefix, or -1. Supports * and a trailing $."""
+    if rule == "":
+        return -1                                      # an empty Disallow allows all
+    anchored = rule.endswith("$")
+    body = rule[:-1] if anchored else rule
+    regex = "".join(".*" if ch == "*" else re.escape(ch) for ch in body)
+    m = re.match(regex + ("$" if anchored else ""), path)
+    return len(body) if m else -1
+
+
+def robots_allows(parsed: dict, agent: str, path: str) -> tuple[bool, str]:
+    """Longest-match wins, Allow wins ties — the convention crawlers follow.
+
+    Returns (allowed, which_group). The group matters for the report: 'no rules
+    for you, falling back to *' is a different situation from 'you are named'.
+    """
+    agents = parsed["agents"]
+    key = agent.lower() if agent.lower() in agents else ("*" if "*" in agents else "")
+    if not key:
+        return True, "no robots.txt rules at all"
+    best_allow = best_disallow = -1
+    for kind, rule in agents[key]:
+        n = _robots_path_match(rule, path)
+        if n < 0:
+            continue
+        if kind == "allow":
+            best_allow = max(best_allow, n)
+        else:
+            best_disallow = max(best_disallow, n)
+    allowed = best_allow >= best_disallow
+    return allowed, ("named explicitly" if key == agent.lower() else "falls back to *")
+
+
+async def fetch_page_facts(client, url: str) -> tuple[_PageFacts | None, str]:
+    try:
+        r = await client.get(url, follow_redirects=True, timeout=PAGE_CHECK_TIMEOUT,
+                             headers={"User-Agent": SOURCE_BROWSER_UA})
+    except httpx.TimeoutException:
+        return None, f"took longer than {PAGE_CHECK_TIMEOUT:.0f}s to respond"
+    except httpx.ConnectError:
+        return None, "could not connect"
+    except Exception as exc:
+        return None, f"fetch failed ({type(exc).__name__})"
+    if r.status_code != 200:
+        return None, _reason_for_status(r.status_code)
+    facts = _PageFacts()
+    try:
+        facts.feed(r.text)
+    except Exception:
+        return None, "page markup could not be parsed"
+    return facts, ""
+
+
+async def fetch_robots(client, origin: str) -> tuple[dict, str]:
+    try:
+        r = await client.get(origin.rstrip("/") + "/robots.txt",
+                             follow_redirects=True, timeout=PAGE_CHECK_TIMEOUT,
+                             headers={"User-Agent": SOURCE_BROWSER_UA})
+    except Exception as exc:
+        return {"agents": {}, "sitemaps": []}, f"could not read robots.txt ({type(exc).__name__})"
+    if r.status_code == 404:
+        # Not an error: no robots.txt means everything is permitted.
+        return {"agents": {}, "sitemaps": [], "missing": True}, ""
+    if r.status_code != 200:
+        return {"agents": {}, "sitemaps": []}, f"robots.txt returned {r.status_code}"
+    return parse_robots(r.text), ""
+
+
+# ── the checks ──
+
+def check_self_declaration(place: dict, rivals: list[dict], brand: str,
+                           terms: list[str], missed: list[dict]) -> dict | None:
+    """The page says what it is in three places. Does it say the category?"""
+    if place["in_title"] and place["in_h1"] and place["in_meta_description"]:
+        return None
+    term = terms[0] if terms else ""
+    missing = [f for f, k in (("title", "in_title"), ("H1", "in_h1"),
+                              ("meta description", "in_meta_description")) if not place[k]]
+    rivals_with = [r["name"] for r in rivals if r["placement"].get("in_title")]
+
+    proposed_title = f"{brand} — {term}".strip(" —")
+    if place["title"] and term:
+        proposed_title = f"{brand} — {term}: {place['title'].split('—')[-1].strip()}".rstrip(": ")
+
+    return {
+        "id": "self_declaration",
+        "severity": "high",
+        "title": "The page does not declare the category it competes in",
+        "found": (f"'{term}' appears {place['body_occurrences']} time(s) in the body, "
+                  f"but not in the {', '.join(missing)}."),
+        "why": ("A model answering a category question matches on what the page declares "
+                "itself to be, not on how often a phrase occurs further down. Frequency in "
+                "body copy and case studies does not substitute for the title, the H1 and "
+                "the description — and a page can lead on those three with far fewer "
+                "mentions overall and still be the one named."),
+        "affects_prompts": [m["text"] for m in missed
+                            if m.get("type") in ("comparison", "commercial", "vertical")][:6],
+        "competitors_doing_it": rivals_with,
+        "changes": [
+            {"field": "title", "where": "<head><title>",
+             "current": place["title"], "proposed": proposed_title},
+            {"field": "h1", "where": "first <h1> on the page",
+             "current": place["h1"], "proposed": term.capitalize() if term else ""},
+            {"field": "meta_description", "where": '<meta name="description">',
+             "current": place["meta_description"],
+             "proposed": (f"{brand} — {term}. " + (place["meta_description"] or ""))[:300].strip()},
+        ],
+    }
+
+
+def check_question_content(facts: _PageFacts, rivals: list[dict],
+                           missed: list[dict]) -> dict | None:
+    """Question-shaped prompts need question-shaped content to land on."""
+    asked = [m for m in missed if m.get("type") in ("problem", "commercial", "technical")]
+    if not asked:
+        return None
+    own_questions = facts.questions()
+    if own_questions and facts.has_faq_schema():
+        return None
+    rivals_with = [r["name"] for r in rivals
+                   if r["questions"] or r["has_faq_schema"]]
+    return {
+        "id": "question_content",
+        "severity": "high" if not own_questions else "medium",
+        "title": "No question-shaped content for the questions you are losing",
+        "found": (f"{len(own_questions)} heading(s) on the page are phrased as a question"
+                  + ("" if facts.has_faq_schema() else ", and there is no FAQPage markup")
+                  + f". {len(asked)} of the prompts you were not named in are questions."),
+        "why": ("A model answering a question prefers a passage that is itself that question "
+                "followed by an answer. Prose that contains the answer without ever asking "
+                "the question is harder to retrieve for it, which is why an FAQ outperforms "
+                "a better-written page without one."),
+        "affects_prompts": [m["text"] for m in asked][:8],
+        "competitors_doing_it": rivals_with,
+        "changes": [
+            {"field": "faq", "where": "a new FAQ section, with FAQPage JSON-LD",
+             "current": "; ".join(own_questions[:5]),
+             # The questions are the prompts the brand actually lost, not invented ones.
+             "proposed": "\n".join(m["text"] for m in asked[:8])},
+        ],
+    }
+
+
+def check_ai_crawlers(parsed: dict, path: str, rivals: list[dict]) -> dict | None:
+    blocked, unnamed = [], []
+    for operator, agents in AI_CRAWLERS.items():
+        for agent in agents:
+            allowed, how = robots_allows(parsed, agent, path)
+            if not allowed:
+                blocked.append(f"{agent} ({operator})")
+            elif how == "falls back to *":
+                unnamed.append(agent)
+    if not blocked and not unnamed:
+        return None
+    rivals_naming = [r["name"] for r in rivals if r.get("names_ai_crawlers")]
+    lines = ["# Assistants that answer questions about your category",
+             *[f"User-agent: {a}" for a in AI_CRAWLER_FLAT],
+             f"Allow: {path}", ""]
+    if not parsed.get("sitemaps"):
+        lines.append("Sitemap: https://YOUR-DOMAIN/sitemap.xml")
+    return {
+        "id": "ai_crawlers",
+        "severity": "high" if blocked else "low",
+        "title": ("AI crawlers are blocked from this page" if blocked
+                  else ("No robots.txt rules name the AI crawlers" if len(unnamed) == len(AI_CRAWLER_FLAT)
+                        else "Some AI crawlers have no rules of their own")),
+        "found": (f"Blocked: {', '.join(blocked)}. " if blocked else "")
+                 + (f"{len(unnamed)} AI crawler(s) have no rules of their own and fall back "
+                    f"to the wildcard group. " if unnamed else "")
+                 + ("No sitemap is declared." if not parsed.get("sitemaps") else ""),
+        "why": ("A blocked crawler cannot be fixed by any amount of content work — it is the "
+                "one failure that makes everything else pointless. Crawlers with no rules of "
+                "their own are not blocked, so this is not urgent on its own; it matters "
+                "because a wildcard group written for search engines can disallow paths for "
+                "reasons that no longer apply, and because naming them is how competitors "
+                "signal they are paying attention."),
+        "affects_prompts": [],
+        "competitors_doing_it": rivals_naming,
+        "changes": [{"field": "robots.txt", "where": "/robots.txt",
+                     "current": "", "proposed": "\n".join(lines)}],
+    }
+
+
+def check_js_rendered(facts: _PageFacts) -> dict | None:
+    body = facts.body_text()
+    if len(body) >= 400:
+        return None
+    return {
+        "id": "js_rendered",
+        "severity": "high",
+        "title": "The page has almost no text until JavaScript runs",
+        "found": f"Only {len(body)} characters of text are present in the HTML itself.",
+        "why": ("Most crawlers that feed assistants do not run JavaScript, so they see an "
+                "empty page. Nothing else on this list can help while this is true."),
+        "affects_prompts": [],
+        "competitors_doing_it": [],
+        "changes": [{"field": "rendering", "where": "the build",
+                     "current": f"{len(body)} characters server-rendered",
+                     "proposed": "Server-render or prerender this page so the text is in the HTML."}],
+    }
+
+
+# ── endpoint ──
+
+class PageCheckRequest(BaseModel):
+    # The page to check. Not the domain: a loyalty product competes as a page.
+    website: str
+    brand: str
+    # Words a buyer uses for the category. Falls back to splitting `category`.
+    category: str = ""
+    category_terms: list[str] = []
+    competitors: list[Competitor] = []
+    # The prompts the brand was NOT named in, with their type. This is what
+    # turns generic advice into "add these four questions": the FAQ we propose
+    # is built from questions the brand actually lost, not invented ones.
+    missed_prompts: list[dict] = []
+
+
+def _origin_and_path(url: str) -> tuple[str, str]:
+    if not url.startswith("http"):
+        url = "https://" + url
+    m = re.match(r"(https?://[^/]+)(/.*)?$", url)
+    if not m:
+        return url.rstrip("/"), "/"
+    return m.group(1), (m.group(2) or "/")
+
+
+def _terms_for(req: "PageCheckRequest") -> list[str]:
+    if req.category_terms:
+        return [t.strip() for t in req.category_terms if t.strip()]
+    cat = (req.category or "").strip()
+    return [cat] if cat else []
+
+
+async def _rival_profile(client, name: str, url: str, terms: list[str]) -> dict:
+    facts, reason = await fetch_page_facts(client, url if url.startswith("http") else "https://" + url)
+    if not facts:
+        return {"name": name, "url": url, "unreadable": reason,
+                "placement": {}, "questions": [], "has_faq_schema": False,
+                "names_ai_crawlers": False}
+    origin, path = _origin_and_path(url)
+    robots, _ = await fetch_robots(client, origin)
+    named = any(a.lower() in robots.get("agents", {}) for a in AI_CRAWLER_FLAT)
+    return {"name": name, "url": url, "unreadable": "",
+            "placement": term_placement(facts, terms),
+            "questions": facts.questions(),
+            "has_faq_schema": facts.has_faq_schema(),
+            "names_ai_crawlers": named}
+
+
+@app.post("/page-check")
+async def page_check(request: PageCheckRequest):
+    """Why the models do not name this page, and the exact change to make.
+
+    Deliberately separate from /audit: it is far cheaper, and it is meant to be
+    re-run after a fix. Re-running it is how a before-and-after gets measured
+    without paying for a whole audit again.
+    """
+    terms = _terms_for(request)
+    if not terms:
+        return {"error": "no category to check against",
+                "detail": "Pass category or category_terms — without them there is "
+                          "nothing to look for on the page."}
+    if not request.website.strip():
+        return {"error": "no page to check"}
+
+    url = request.website.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    origin, path = _origin_and_path(url)
+
+    async with httpx.AsyncClient() as client:
+        facts, reason = await fetch_page_facts(client, url)
+        if not facts:
+            return {"error": "could not read the page", "detail": reason, "url": url}
+
+        robots, robots_reason = await fetch_robots(client, origin)
+
+        # A page with no server-rendered text makes checks 1 and 2 measure
+        # nothing, so it is reported alone rather than alongside them.
+        gate = check_js_rendered(facts)
+        if gate:
+            return {"url": url, "brand": request.brand, "terms": terms,
+                    "blocked_by": gate["id"], "findings": [gate],
+                    "competitors": [], "robots_note": robots_reason}
+
+        rivals = []
+        for c in request.competitors[:5]:
+            if c.website and c.website.strip():
+                rivals.append(await _rival_profile(client, c.name, c.website.strip(), terms))
+
+    readable = [r for r in rivals if not r["unreadable"]]
+    place = term_placement(facts, terms)
+    missed = [m for m in request.missed_prompts if m.get("text")]
+
+    findings = [f for f in (
+        check_self_declaration(place, readable, request.brand, terms, missed),
+        check_question_content(facts, readable, missed),
+        check_ai_crawlers(robots, path, readable),
+    ) if f]
+    order = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda f: order.get(f["severity"], 3))
+
+    return {
+        "url": url,
+        "brand": request.brand,
+        "terms": terms,
+        "page": {"title": facts.title, "h1": facts.h1(),
+                 "meta_description": facts.meta_description,
+                 "questions": facts.questions(),
+                 "schema_types": facts.schema_types(),
+                 "body_chars": len(facts.body_text())},
+        "placement": place,
+        "robots": {"sitemaps": robots.get("sitemaps", []),
+                   "named_ai_agents": [a for a in AI_CRAWLER_FLAT
+                                       if a.lower() in robots.get("agents", {})],
+                   "note": robots_reason},
+        "findings": findings,
+        "competitors": [{"name": r["name"], "url": r["url"], "unreadable": r["unreadable"],
+                         "in_title": r["placement"].get("in_title", False),
+                         "in_h1": r["placement"].get("in_h1", False),
+                         "in_meta_description": r["placement"].get("in_meta_description", False),
+                         "questions": len(r["questions"]),
+                         "has_faq_schema": r["has_faq_schema"],
+                         "names_ai_crawlers": r["names_ai_crawlers"]} for r in rivals],
+    }
+
+
 async def _fetch_page_text(client, url: str) -> tuple[str, str]:
     """Return (text, reason). Exactly one of them is non-empty.
 
