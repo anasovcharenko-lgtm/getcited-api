@@ -54,6 +54,11 @@ class AuditRequest(BaseModel):
     # place in a broad comparison however good its site is. Blank falls back to
     # DEFAULT_BRAND_SIZE, so an older client that omits it keeps working.
     brand_size: str = ""
+    # Which models to run for THIS audit, e.g. ["chatgpt"]. Empty means every
+    # model switched on globally, so a client that does not send the field keeps
+    # its old behaviour. This narrows what runs; it never enables anything,
+    # because enabling a model is a billing decision, not a per-audit one.
+    models: list[str] = []
 
 def extract_urls(text: str) -> list[str]:
     pattern = r'https?://[^\s\)\]\,\"\'<>]+'
@@ -255,6 +260,39 @@ OPENAI_UTILITY_FALLBACKS = ["gpt-5-nano", "gpt-4.1-mini"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
 GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
+
+# The registry. Every model the audit knows about is declared here once, in
+# display order, with the switch that says whether it can run at all.
+#
+# Adding a model means four edits and no more: a line here, its ask_* function,
+# one branch in run_prompt, and its block in the results loop. Availability,
+# per-audit selection, scoring and status all read from this registry, so a new
+# model gets its switch without anyone remembering to add one.
+MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
+    "chatgpt": lambda: True,                 # no switch: without it there is no audit
+    "gemini": lambda: GEMINI_ENABLED,
+}
+ALL_MODELS = list(MODEL_SWITCHES)
+
+
+def available_models() -> list[str]:
+    """Models that could run right now, before the client narrows them."""
+    return [m for m, on in MODEL_SWITCHES.items() if on()]
+
+
+def selected_models(requested: list[str] | None) -> list[str]:
+    """What this audit will actually run.
+
+    A requested model that is switched off globally stays off: the request
+    narrows, it never enables. An empty intersection falls back to everything
+    available, because measuring nothing and reporting 0% would read as "you are
+    invisible" when the truth is "you measured nothing".
+    """
+    avail = available_models()
+    if not requested:
+        return avail
+    want = {m.strip().lower() for m in requested if m and m.strip()}
+    return [m for m in avail if m in want] or avail
 
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_ENABLED:
@@ -762,6 +800,9 @@ async def run_audit(request: AuditRequest):
                           # Size changes which prompts run, so the same brand at
                           # two sizes is two different audits.
                           (request.brand_size or "").strip().lower(),
+                          # Two audits of the same brand on different models are
+                          # different audits, not a cache hit.
+                          ",".join(sorted(selected_models(request.models))),
                           "|".join(sorted(p.strip() for p in request.custom_prompts))])
     cached = AUDIT_CACHE.get(cache_key)
     if cached and (asyncio.get_event_loop().time() - cached[0]) < AUDIT_CACHE_TTL:
@@ -803,10 +844,18 @@ async def run_audit(request: AuditRequest):
     else:
         brand_domain = ""
 
+    running = selected_models(request.models)
+    print(f"  models for this run: {', '.join(running)}")
+
+    async def _skip() -> str:
+        """A model that was not selected returns nothing and costs nothing."""
+        return ""
+
     async def run_prompt(prompt):
         gemini_answer, openai_answer = await asyncio.gather(
-            ask_gemini(prompt),
+            ask_gemini(prompt) if "gemini" in running else _skip(),
             ask_openai(prompt, use_search=True, country=request.country)
+            if "chatgpt" in running else _skip()
         )
         return prompt, gemini_answer, openai_answer
 
@@ -898,7 +947,9 @@ async def run_audit(request: AuditRequest):
 
     gemini_mentions = sum(1 for r in results if r["gemini"]["mentioned"])
     openai_mentions = sum(1 for r in results if r["chatgpt"]["mentioned"])
-    active_models = 1 + (1 if GEMINI_ENABLED else 0)
+    # Divide by what was measured, not by what exists. Scoring a one-model run
+    # as though two had answered would halve every client's visibility.
+    active_models = len(running)
     total_checks = len(prompts) * active_models
     visibility_score = int((gemini_mentions + openai_mentions) / total_checks * 100) if total_checks > 0 else 0
 
@@ -983,9 +1034,18 @@ Data: """ + summary)
             "chatgpt": OPENAI_SEARCH_MODEL,
             "gemini": GEMINI_MODEL,
         },
+        "models_run": running,
+        "models_available": available_models(),
+        # Built from the registry, so a model added later reports its status
+        # without this block being touched. "did not run" and "ran and found
+        # nothing" are different facts and must not look alike.
         "model_status": {
-            "gemini": {"ok": "gemini" not in MODEL_ERRORS, "enabled": GEMINI_ENABLED, "error": MODEL_ERRORS.get("gemini")},
-            "chatgpt": {"ok": "chatgpt" not in MODEL_ERRORS, "error": MODEL_ERRORS.get("chatgpt")},
+            m: {"ok": m in running and m not in MODEL_ERRORS,
+                "enabled": MODEL_SWITCHES[m](),
+                "selected": m in running,
+                "error": (MODEL_ERRORS.get(m) if m in running
+                          else "not selected for this audit")}
+            for m in ALL_MODELS
         },
         "visibility_score": visibility_score,
         "gemini_score": gemini_mentions,
