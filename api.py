@@ -42,9 +42,13 @@ class AuditRequest(BaseModel):
     # Language is separate from country on purpose: a UK-targeted brand can
     # have a Russian-speaking audience, and one field cannot express that.
     language: str = ""
-    # When present, these run instead of generated ones. Not alongside: mixing
-    # them would make it unclear what was actually measured.
+    # When present, these run INSTEAD of generated ones. Choosing "write my own"
+    # means measuring exactly these, so topping them up would defeat it.
     custom_prompts: list[str] = []
+    # These run IN ADDITION to whatever else the audit runs. Tracked prompts
+    # arrive here: the point of tracking a query is to watch it alongside the
+    # rest, not to replace the rest with it.
+    extra_prompts: list[str] = []
     # The market being sold INTO, not where the company sits. A US company
     # targeting the UK should be measured on UK results, in English.
     country: str = "US"
@@ -244,6 +248,9 @@ def market_language(country: str) -> str:
 PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "20"))
 # Every prompt costs money, so hand-written lists get a ceiling too.
 MAX_CUSTOM_PROMPTS = int(os.getenv("MAX_CUSTOM_PROMPTS", "20"))
+# Added prompts cost the same per run as generated ones, so they get a ceiling
+# of their own rather than borrowing the one above.
+MAX_EXTRA_PROMPTS = int(os.getenv("MAX_EXTRA_PROMPTS", "20"))
 # Cap answer length. NOTE: on reasoning models this budget also covers internal
 # reasoning tokens, so setting it too low returns an EMPTY answer with no error.
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
@@ -803,7 +810,8 @@ async def run_audit(request: AuditRequest):
                           # Two audits of the same brand on different models are
                           # different audits, not a cache hit.
                           ",".join(sorted(selected_models(request.models))),
-                          "|".join(sorted(p.strip() for p in request.custom_prompts))])
+                          "|".join(sorted(p.strip() for p in request.custom_prompts)),
+                          "|".join(sorted(p.strip() for p in request.extra_prompts))])
     cached = AUDIT_CACHE.get(cache_key)
     if cached and (asyncio.get_event_loop().time() - cached[0]) < AUDIT_CACHE_TTL:
         print(f"Audit cache hit: {cache_key}")
@@ -819,6 +827,7 @@ async def run_audit(request: AuditRequest):
     language = (request.language or "").strip() or market_language(request.country)
 
     custom = [p.strip() for p in request.custom_prompts if p.strip()][:MAX_CUSTOM_PROMPTS]
+    extra = [p.strip() for p in request.extra_prompts if p.strip()][:MAX_EXTRA_PROMPTS]
     if custom:
         # Hand-written prompts replace generation entirely. The point of choosing
         # "manual" is to measure exactly these, so quietly topping them up with
@@ -829,6 +838,21 @@ async def run_audit(request: AuditRequest):
         prompt_specs = await generate_prompts(clean_brand, category, competitors,
                                               request.country, language,
                                               request.brand_size)
+    # Added prompts sit on top of whatever the branch above produced, in both
+    # modes. A tracked query is watched ALONGSIDE the rest; replacing the whole
+    # set with it was the old behaviour and it silently changed what the
+    # visibility score was a percentage of.
+    if extra:
+        seen = {p["text"].strip().lower() for p in prompt_specs}
+        added = 0
+        for text in extra:
+            if text.lower() in seen:
+                continue          # already being measured; running it twice costs twice
+            seen.add(text.lower())
+            prompt_specs.append({"text": text, "type": "tracked"})
+            added += 1
+        print(f"  plus {added} tracked prompt(s), {len(prompt_specs)} in total")
+
     prompts = [p["text"] for p in prompt_specs]
     prompt_type_by_text = {p["text"]: p["type"] for p in prompt_specs}
 
