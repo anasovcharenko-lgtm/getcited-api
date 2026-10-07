@@ -49,6 +49,10 @@ class AuditRequest(BaseModel):
     # arrive here: the point of tracking a query is to watch it alongside the
     # rest, not to replace the rest with it.
     extra_prompts: list[str] = []
+    # Extending an audit re-uses the audit path for the added prompts only, and
+    # the recommendations it would write for two prompts are both wrong and
+    # paid for. The caller keeps the ones it already has.
+    skip_recommendations: bool = False
     # The market being sold INTO, not where the company sits. A US company
     # targeting the UK should be measured on UK results, in English.
     country: str = "US"
@@ -774,6 +778,81 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
     return found[:12]
 
 
+def aggregate_audit(results: list[dict], running: list[str], brand: str,
+                    clean_brand: str, competitors: list[str],
+                    competitor_domains: dict, brand_domain: str) -> dict:
+    """Every number the dashboard shows, derived from the results alone.
+
+    Extracted so an audit and an extended audit cannot drift apart. It reads
+    only fields that also reach the client, which is what makes recomputing a
+    merged set possible at all: the raw answers are discarded before the
+    response is sent, so a count that re-scans them could never be reproduced.
+
+    Counting a competitor from `competitors_found` instead of re-scanning the
+    raw answer gives identical numbers — process_model already did that scan,
+    and this just stops repeating it.
+    """
+    gemini_mentions = sum(1 for r in results if r["gemini"]["mentioned"])
+    openai_mentions = sum(1 for r in results if r["chatgpt"]["mentioned"])
+    # Divide by what was measured, not by what exists. Scoring a one-model run
+    # as though two had answered would halve every client's visibility.
+    active_models = len(running)
+    total_checks = len(results) * active_models
+    visibility_score = (int((gemini_mentions + openai_mentions) / total_checks * 100)
+                        if total_checks > 0 else 0)
+
+    mentions_with_link_count = sum(1 for r in results for m in ("gemini", "chatgpt")
+                                   if r[m]["mentioned_with_link"])
+    mentions_without_link_count = sum(1 for r in results for m in ("gemini", "chatgpt")
+                                      if r[m]["mentioned_without_link"])
+
+    def get_search_name(b):
+        return extract_brand_from_url(b) if b.startswith("http") else b
+
+    competitor_stats = []
+    for b in [clean_brand] + competitors:
+        search_b = get_search_name(b)
+        is_you = b == brand or b == clean_brand
+        if is_you:
+            g = gemini_mentions
+            c = openai_mentions
+            with_link = mentions_with_link_count
+            without_link = mentions_without_link_count
+        else:
+            g = sum(1 for r in results if search_b in r["gemini"]["competitors_found"])
+            c = sum(1 for r in results if search_b in r["chatgpt"]["competitors_found"])
+            with_link = sum(1 for r in results for m in ("gemini", "chatgpt")
+                            if search_b in r[m]["competitors_with_link"])
+            without_link = sum(1 for r in results for m in ("gemini", "chatgpt")
+                               if search_b in r[m]["competitors_without_link"])
+        competitor_stats.append({
+            "name": search_b,
+            "is_your_brand": is_you,
+            # Carried through so the page check can compare this brand's page
+            # with the pages of the rivals that actually get named.
+            "domain": (brand_domain if is_you else competitor_domains.get(search_b, "")),
+            "gemini_mentions": g,
+            "chatgpt_mentions": c,
+            "total_mentions": g + c,
+            "mention_rate": round((g + c) / total_checks * 100, 1) if total_checks > 0 else 0,
+            "mentions_with_link": with_link,
+            "mentions_without_link": without_link,
+        })
+    competitor_stats.sort(key=lambda x: x["total_mentions"], reverse=True)
+    for i, stat in enumerate(competitor_stats):
+        stat["rank"] = i + 1
+
+    return {
+        "visibility_score": visibility_score,
+        "gemini_score": gemini_mentions,
+        "chatgpt_score": openai_mentions,
+        "total_prompts": len(results),
+        "mentions_score": mentions_with_link_count,
+        "citations_score": mentions_without_link_count,
+        "competitor_ranking": competitor_stats,
+    }
+
+
 @app.post("/audit")
 async def run_audit(request: AuditRequest):
     brand = request.brand
@@ -969,52 +1048,14 @@ async def run_audit(request: AuditRequest):
             },
         })
 
-    gemini_mentions = sum(1 for r in results if r["gemini"]["mentioned"])
-    openai_mentions = sum(1 for r in results if r["chatgpt"]["mentioned"])
-    # Divide by what was measured, not by what exists. Scoring a one-model run
-    # as though two had answered would halve every client's visibility.
-    active_models = len(running)
-    total_checks = len(prompts) * active_models
-    visibility_score = int((gemini_mentions + openai_mentions) / total_checks * 100) if total_checks > 0 else 0
-
-    mentions_with_link_count = sum(1 for r in results for m in ("gemini", "chatgpt") if r[m]["mentioned_with_link"])
-    mentions_without_link_count = sum(1 for r in results for m in ("gemini", "chatgpt") if r[m]["mentioned_without_link"])
-
-    def get_search_name(b):
-        if b.startswith('http'):
-            return extract_brand_from_url(b)
-        return b
-
-    all_brands = [clean_brand] + competitors
-    competitor_stats = []
-    for b in all_brands:
-        search_b = get_search_name(b)
-        is_you = b == brand or b == clean_brand
-        g = sum(1 for r in results if brand_in_text(r["_gemini_raw"], search_b))
-        c = sum(1 for r in results if brand_in_text(r["_chatgpt_raw"], search_b))
-        if is_you:
-            with_link = mentions_with_link_count
-            without_link = mentions_without_link_count
-        else:
-            with_link = sum(1 for r in results for m in ("gemini", "chatgpt") if search_b in r[m]["competitors_with_link"])
-            without_link = sum(1 for r in results for m in ("gemini", "chatgpt") if search_b in r[m]["competitors_without_link"])
-        competitor_stats.append({
-            "name": search_b,
-            "is_your_brand": is_you,
-            # Carried through so the page check can compare this brand's page
-            # with the pages of the rivals that actually get named. Without it
-            # the comparison would have to ask the user to retype the URLs.
-            "domain": (brand_domain if is_you else competitor_domains.get(search_b, "")),
-            "gemini_mentions": g,
-            "chatgpt_mentions": c,
-            "total_mentions": g + c,
-            "mention_rate": round((g + c) / total_checks * 100, 1) if total_checks > 0 else 0,
-            "mentions_with_link": with_link,
-            "mentions_without_link": without_link,
-        })
-    competitor_stats.sort(key=lambda x: x["total_mentions"], reverse=True)
-    for i, stat in enumerate(competitor_stats):
-        stat["rank"] = i + 1
+    totals = aggregate_audit(results, running, brand, clean_brand, competitors,
+                             competitor_domains, brand_domain)
+    gemini_mentions = totals["gemini_score"]
+    openai_mentions = totals["chatgpt_score"]
+    visibility_score = totals["visibility_score"]
+    mentions_with_link_count = totals["mentions_score"]
+    mentions_without_link_count = totals["citations_score"]
+    competitor_stats = totals["competitor_ranking"]
 
     discovered = await discover_brands(results, competitors + [clean_brand], category)
     if discovered:
@@ -1033,7 +1074,8 @@ async def run_audit(request: AuditRequest):
     citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:10]
     summary = "Brand: " + clean_brand + ", Category: " + category + ", Score: " + str(visibility_score) + "%"
 
-    rec_response = await ask_openai("You are an AI visibility consultant. Give exactly 3 specific recommendations to improve " + clean_brand + " visibility in AI models. Category: " + category + """ Format each as:
+    rec_response = "" if request.skip_recommendations else await ask_openai(
+        "You are an AI visibility consultant. Give exactly 3 specific recommendations to improve " + clean_brand + " visibility in AI models. Category: " + category + """ Format each as:
 PRIORITY: [High/Medium/Low]
 ACTION: [specific action]
 WHY: [one sentence]
@@ -1099,6 +1141,91 @@ Data: """ + summary)
         AUDIT_CACHE[cache_key] = (asyncio.get_event_loop().time(), payload)
 
     return payload
+
+# ─────────────────────────────────────────────────────────────
+# Extending an audit: measure a few more prompts and fold them in
+# ─────────────────────────────────────────────────────────────
+
+class ExtendRequest(AuditRequest):
+    """An audit already seen, plus the prompts to add to it.
+
+    previous_results are the result rows the caller already holds, exactly as
+    /audit returned them. They are not re-measured and not re-charged.
+    """
+    previous_results: list[dict] = []
+    previous_citations: list[dict] = []
+
+
+@app.post("/audit/extend")
+async def extend_audit(request: ExtendRequest):
+    new_prompts = [p.strip() for p in request.extra_prompts if p.strip()][:MAX_EXTRA_PROMPTS]
+    previous = request.previous_results or []
+
+    if not new_prompts:
+        return {"error": "no prompts to add"}
+    if not previous:
+        return {"error": "nothing to extend",
+                "detail": "Send the results you already have, or run a normal audit."}
+
+    # Skip anything already measured. Adding a prompt twice would charge twice
+    # and weight it double in the score.
+    seen = {r.get("prompt", "").strip().lower() for r in previous}
+    todo = [p for p in new_prompts if p.lower() not in seen]
+    if not todo:
+        return {"error": "those prompts are already in this audit"}
+
+    # Measure ONLY the added prompts, through the ordinary audit path so that a
+    # prompt measured here is measured exactly as one measured there.
+    sub = AuditRequest(**{**request.model_dump(
+        exclude={"previous_results", "previous_citations", "extra_prompts", "custom_prompts"}),
+        "custom_prompts": todo, "extra_prompts": [], "skip_recommendations": True})
+    measured = await run_audit(sub)
+    if not isinstance(measured, dict) or "results" not in measured:
+        return {"error": "could not measure the added prompts", "detail": str(measured)[:300]}
+
+    merged = previous + measured["results"]
+
+    # The same function the ordinary audit uses, so an extended audit and a
+    # fresh one of the same prompts cannot report different numbers.
+    running = measured.get("models_run") or selected_models(request.models)
+    competitors, competitor_domains = [], {}
+    for c in request.competitor_list:
+        for i, n in enumerate([x.strip() for x in c.name.split(",") if x.strip()]):
+            competitors.append(n)
+            sites = [w.strip() for w in c.website.split(",") if w.strip()]
+            site = sites[i] if i < len(sites) else (sites[0] if len(sites) == 1 else "")
+            if site:
+                competitor_domains[n] = extract_domain(
+                    site if site.startswith("http") else "https://" + site)
+    if not competitors:
+        competitors = [n.strip() for c in request.competitors for n in c.split(",") if n.strip()]
+
+    clean_brand = measured.get("brand") or request.brand
+    brand_domain = measured.get("brand_domain", "")
+    totals = aggregate_audit(merged, running, request.brand, clean_brand,
+                             competitors, competitor_domains, brand_domain)
+
+    # Citation counts add up by domain; the list stays capped the same way.
+    by_domain = {c["domain"]: dict(c) for c in (request.previous_citations or [])}
+    for c in measured.get("citations", []):
+        cur = by_domain.get(c["domain"])
+        if cur:
+            for k in ("gemini_count", "chatgpt_count", "total"):
+                cur[k] = cur.get(k, 0) + c.get(k, 0)
+        else:
+            by_domain[c["domain"]] = dict(c)
+    citations = sorted(by_domain.values(), key=lambda x: x.get("total", 0), reverse=True)[:10]
+
+    print(f"  extended audit: {len(previous)} + {len(measured['results'])} = {len(merged)} prompts")
+
+    return {**measured, **totals,
+            "results": merged,
+            "citations": citations,
+            "added_prompts": todo,
+            # The caller keeps its own recommendations: these were not regenerated.
+            "recommendations": "",
+            "extended_at": datetime.now(timezone.utc).isoformat()}
+
 
 @app.post("/clear-cache")
 async def clear_cache():
