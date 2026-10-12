@@ -523,63 +523,153 @@ async def ask_gemini(prompt: str) -> str:
         MODEL_ERRORS["gemini"] = str(e)[:300]
         return ""
 
+"""Perplexity moved Sonar off /chat/completions onto the Agent API, and the two
+descriptions of where it went disagree: the live API's own 403 says
+`/v1/responses`, while the migration guide's curl example posts to `/v1/agent`
+with a `preset` instead of a `model`. Both may be true — one OpenAI-compatible,
+one native — and neither can be confirmed from here without a key.
+
+So the shapes are a list, tried in order until one answers, and the one that
+worked is remembered for the rest of the process. The server's own error message
+is first because it is the more direct evidence. If Perplexity changes this
+again, the fix is a line in this list rather than a rewrite.
+"""
+
+PERPLEXITY_PRESET = os.getenv("PERPLEXITY_PRESET", "fast")
+
+PERPLEXITY_SHAPES: list[tuple[str, str]] = [
+    # (path, how the body names the thing to run)
+    ("/v1/responses", "model"),   # what the live 403 pointed at
+    ("/v1/agent", "preset"),      # what the migration guide shows
+    ("/chat/completions", "chat"),  # the old one, for a key still on it
+]
+_perplexity_shape: int | None = None   # index of the one that answered
+
+
+def _perplexity_body(kind: str, prompt: str) -> dict:
+    if kind == "chat":
+        return {"model": PERPLEXITY_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": MAX_ANSWER_TOKENS}
+    if kind == "preset":
+        return {"preset": PERPLEXITY_PRESET, "input": prompt}
+    return {"model": PERPLEXITY_MODEL, "input": prompt}
+
+
+def _perplexity_text(data: dict) -> str:
+    """The answer, wherever this version of the API puts it."""
+    if isinstance(data.get("output_text"), str) and data["output_text"]:
+        return data["output_text"]
+    # The typed trace: find the message item and join its text parts.
+    parts: list[str] = []
+    for item in (data.get("output") or []):
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for c in (item.get("content") or []):
+            if isinstance(c, dict) and isinstance(c.get("text"), str):
+                parts.append(c["text"])
+    if parts:
+        return "\n".join(parts)
+    # The old chat shape.
+    return ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
+
+
+def _perplexity_urls(data: dict) -> list[str]:
+    """Every source, from whichever place this version lists them.
+
+    The migration guide describes the results list but not the name of the field
+    holding the URL, so a result contributes its `url` if it has one and
+    otherwise the first value in it that looks like a link. Guessing the key
+    would mean silently losing the sources the moment it is not `url`.
+    """
+    urls: list[str] = []
+
+    def take(results) -> None:
+        for item in (results or []):
+            if isinstance(item, str) and item.startswith("http"):
+                urls.append(item)
+            elif isinstance(item, dict):
+                u = item.get("url")
+                if not (isinstance(u, str) and u.startswith("http")):
+                    u = next((v for v in item.values()
+                              if isinstance(v, str) and v.startswith("http")), None)
+                if u:
+                    urls.append(u)
+
+    for item in (data.get("output") or []):
+        if isinstance(item, dict) and item.get("type") == "search_results":
+            take(item.get("results"))
+    take(data.get("search_results"))
+    take(data.get("citations"))
+    return list(dict.fromkeys(urls))
+
+
 async def ask_perplexity(prompt: str, country: str = "") -> str:
     """Perplexity always searches, so there is no tool to switch on.
 
-    The sources come back as structured fields rather than inside the prose, and
-    which field depends on the API version, so both are read and folded into the
-    same "Sources:" block the other models produce. Without that the answer would
-    reach the screen with no sources at all — Perplexity rarely inlines URLs.
+    The sources come back as structured fields rather than inside the prose, so
+    they are folded into the same "Sources:" block the other models produce.
+    Without that the answer would reach the screen with no sources at all —
+    Perplexity cites with bare [1] markers and rarely inlines a URL.
+
+    `country` is accepted and not sent: the old web_search_options field has no
+    documented equivalent here, and inventing a key risks a 400 on every call.
+    Results will be Perplexity's default market until the live shape is known.
     """
+    global _perplexity_shape
     if not PERPLEXITY_ENABLED:
         MODEL_ERRORS["perplexity"] = "disabled"
         return ""
-    try:
-        body: dict = {
-            "model": PERPLEXITY_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": MAX_ANSWER_TOKENS,
-        }
-        if country:
-            # Same reason as the OpenAI search tool: results are location
-            # influenced, and without this we measure Perplexity's default market
-            # rather than the client's.
-            body["web_search_options"] = {"user_location": {"country": country.upper()}}
 
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                         "Content-Type": "application/json"},
-                json=body,
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    order = list(range(len(PERPLEXITY_SHAPES)))
+    if _perplexity_shape is not None:
+        order.remove(_perplexity_shape)
+        order.insert(0, _perplexity_shape)
 
-        urls: list[str] = []
-        for item in (data.get("search_results") or []):
-            if isinstance(item, dict) and item.get("url"):
-                urls.append(item["url"])
-        for u in (data.get("citations") or []):
-            if isinstance(u, str) and u.startswith("http"):
-                urls.append(u)
-        urls = list(dict.fromkeys(urls))
-        if urls:
-            text += "\n\nSources: " + " ".join(urls)
+    last = ""
+    for i in order:
+        path, kind = PERPLEXITY_SHAPES[i]
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(
+                    f"https://api.perplexity.ai{path}",
+                    headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json=_perplexity_body(kind, prompt),
+                )
+            if resp.status_code >= 400:
+                last = f"{resp.status_code} on {path}: {resp.text[:200]}"
+                print(f"Perplexity {last}")
+                # 401 is the key, not the shape, and no other path will fix it —
+                # stop rather than turn one clear failure into three. 403 is not
+                # treated that way: the migration notice arrives as a 403.
+                if resp.status_code == 401:
+                    break
+                continue
 
-        print(f"Perplexity OK: {len(text)} chars, {len(urls)} cited urls")
-        MODEL_ERRORS.pop("perplexity", None)
-        return text
-    except Exception as e:
-        detail = str(e)[:300]
-        # The body carries the reason an auth or quota failure happened; the
-        # status line alone just says 401.
-        if isinstance(e, httpx.HTTPStatusError):
-            detail = f"{e.response.status_code}: {e.response.text[:200]}"
-        print(f"Perplexity error: {detail}")
-        MODEL_ERRORS["perplexity"] = detail
-        return ""
+            data = resp.json()
+            text = _perplexity_text(data)
+            if not text:
+                last = f"{path} answered with no text: {str(data)[:200]}"
+                print(f"Perplexity {last}")
+                continue
+
+            urls = _perplexity_urls(data)
+            if urls:
+                text += "\n\nSources: " + " ".join(urls)
+            if _perplexity_shape != i:
+                print(f"Perplexity: using {path} ({kind})")
+            _perplexity_shape = i
+            print(f"Perplexity OK: {len(text)} chars, {len(urls)} cited urls")
+            MODEL_ERRORS.pop("perplexity", None)
+            return text
+        except Exception as e:
+            last = f"{path}: {str(e)[:200]}"
+            print(f"Perplexity error on {last}")
+            continue
+
+    MODEL_ERRORS["perplexity"] = last or "no response"
+    return ""
 
 
 def search_tool(country: str = "") -> dict:
