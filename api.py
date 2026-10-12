@@ -1168,10 +1168,22 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
                  for m in ALL_MODELS}
     named_count = sum(per_model[m] for m in counted)
 
-    # Divide by what was measured, not by what exists. Scoring a one-model run
-    # as though two had answered would halve every client's visibility.
-    active_models = len(counted)
-    total_checks = len(results) * active_models
+    # Divide by answers, not by attempts.
+    #
+    # This used to be len(results) * len(running) — every prompt times every
+    # model asked. A model that was selected and then failed returns an empty
+    # answer for each prompt, and those empties were counted as measurements:
+    # "the model did not name you" where the truth is "the model never spoke".
+    # One model failing out of three took a third off the score, and off every
+    # competitor's rate, without anything on screen saying the figure had moved
+    # for that reason. The same mistake as dividing by the models that exist
+    # rather than the models that ran, one level further in.
+    answers_by_model = {
+        m: sum(1 for r in results if (r.get(m, {}).get("answer") or "").strip())
+        for m in counted
+    }
+    answered_models = [m for m in counted if answers_by_model[m]]
+    total_checks = sum(answers_by_model.values())
     visibility_score = (int(named_count / total_checks * 100)
                         if total_checks > 0 else 0)
 
@@ -1228,6 +1240,11 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         "gemini_score": per_model.get("gemini", 0),
         "chatgpt_score": per_model.get("chatgpt", 0),
         "model_scores": {m: per_model[m] for m in counted},
+        # The denominator itself, so the dashboard shows the figure this score
+        # was computed from rather than recomputing it from prompts × models and
+        # disagreeing whenever a model was asked and did not answer.
+        "answers": total_checks,
+        "models_answered": answered_models,
         "total_prompts": len(results),
         "mentions_score": mentions_with_link_count,
         "citations_score": mentions_without_link_count,
@@ -1435,6 +1452,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     gemini_mentions = totals["gemini_score"]
     openai_mentions = totals["chatgpt_score"]
     visibility_score = totals["visibility_score"]
+    answers_count = totals["answers"]
     mentions_with_link_count = totals["mentions_score"]
     mentions_without_link_count = totals["citations_score"]
     competitor_stats = totals["competitor_ranking"]
@@ -1485,6 +1503,9 @@ Data: """ + summary)
         # everything else here.
         "models_used": {m: MODEL_VERSIONS[m]() for m in ALL_MODELS},
         "models_run": running,
+        # What was asked, and what actually came back. A model can be in the
+        # first list and absent from the second: selected, called, and silent.
+        "models_answered": totals["models_answered"],
         "models_available": available_models(),
         # Built from the registry, so a model added later reports its status
         # without this block being touched. "did not run" and "ran and found
@@ -1498,6 +1519,8 @@ Data: """ + summary)
             for m in ALL_MODELS
         },
         "visibility_score": visibility_score,
+        "answers": answers_count,
+        "model_scores": totals["model_scores"],
         "gemini_score": gemini_mentions,
         "chatgpt_score": openai_mentions,
         "total_prompts": len(prompts),
