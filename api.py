@@ -436,6 +436,39 @@ PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar")
 PERPLEXITY_ENABLED = (os.getenv("PERPLEXITY_ENABLED", "false").lower() == "true"
                       and bool(PERPLEXITY_API_KEY))
 
+# DeepSeek. Its Responses endpoint runs the search on DeepSeek's own servers, so
+# there is no second vendor to wire up. Deliberately no fallback to
+# /chat/completions: that endpoint answers from memory, which measures what the
+# model remembers rather than what it tells someone asking today — a different
+# quantity wearing the same label.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_ENABLED = (os.getenv("DEEPSEEK_ENABLED", "false").lower() == "true"
+                    and bool(DEEPSEEK_API_KEY))
+
+# Google's AI Overviews. Google publishes no API for them, so this goes through
+# DataForSEO, which runs the search and parses the block. Two consequences worth
+# knowing before reading the numbers:
+#   - it costs about $0.004 a prompt, unlike the models;
+#   - Google shows an AI Overview for only some queries, so a prompt can come
+#     back with nothing. That is "no overview existed", not "you were not named",
+#     and it drops out of the denominator rather than counting against the brand.
+DATAFORSEO_LOGIN = os.getenv("DATAFORSEO_LOGIN", "")
+DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
+AI_OVERVIEW_ENABLED = (os.getenv("AI_OVERVIEW_ENABLED", "false").lower() == "true"
+                       and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
+
+# DataForSEO wants a place, not a country code. Overridable in one env var
+# rather than needing a code change for a market we have not listed.
+DATAFORSEO_LOCATIONS = {
+    "US": "United States", "GB": "United Kingdom", "UK": "United Kingdom",
+    "RU": "Russia", "TR": "Turkey", "DE": "Germany", "FR": "France",
+    "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "PL": "Poland",
+    "AE": "United Arab Emirates", "KZ": "Kazakhstan", "CA": "Canada",
+    "AU": "Australia", "IN": "India", "BR": "Brazil",
+}
+DATAFORSEO_DEFAULT_LOCATION = os.getenv("DATAFORSEO_LOCATION", "United States")
+
 # The registry. Every model the audit knows about is declared here once, in
 # display order, with the switch that says whether it can run at all.
 #
@@ -447,6 +480,8 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "chatgpt": lambda: True,                 # no switch: without it there is no audit
     "gemini": lambda: GEMINI_ENABLED,
     "perplexity": lambda: PERPLEXITY_ENABLED,
+    "deepseek": lambda: DEEPSEEK_ENABLED,
+    "ai_overview": lambda: AI_OVERVIEW_ENABLED,
 }
 ALL_MODELS = list(MODEL_SWITCHES)
 
@@ -456,6 +491,8 @@ MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     "chatgpt": lambda: OPENAI_SEARCH_MODEL,
     "gemini": lambda: GEMINI_MODEL,
     "perplexity": lambda: PERPLEXITY_MODEL,
+    "deepseek": lambda: DEEPSEEK_MODEL,
+    "ai_overview": lambda: "google ai overview via dataforseo",
 }
 
 # How to ask each model. Filled in below as the ask_* functions are defined;
@@ -672,6 +709,149 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
     return ""
 
 
+async def ask_deepseek(prompt: str, country: str = "") -> str:
+    """DeepSeek, with the search it runs on its own servers.
+
+    The Responses endpoint plus a web_search tool; no second vendor. There is
+    deliberately no fallback to /chat/completions — that endpoint answers from
+    memory, and an answer from memory is a different measurement wearing the
+    same label. Better a model that reports a failure than one that quietly
+    starts measuring what it remembers.
+    """
+    if not DEEPSEEK_ENABLED:
+        MODEL_ERRORS["deepseek"] = "disabled"
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(
+                "https://api.deepseek.com/responses",
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": DEEPSEEK_MODEL,
+                      "tools": [{"type": "web_search"}],
+                      "input": prompt},
+            )
+        if resp.status_code >= 400:
+            detail = f"{resp.status_code}: {resp.text[:200]}"
+            print(f"DeepSeek error {detail}")
+            MODEL_ERRORS["deepseek"] = detail
+            return ""
+        data = resp.json()
+        # Same family of shapes as the Perplexity Agent API, so the same readers
+        # work and there is one place to fix if either moves again.
+        text = _perplexity_text(data)
+        if not text:
+            MODEL_ERRORS["deepseek"] = f"answered with no text: {str(data)[:200]}"
+            return ""
+        urls = _perplexity_urls(data)
+        if urls:
+            text += "\n\nSources: " + " ".join(urls)
+        print(f"DeepSeek OK: {len(text)} chars, {len(urls)} cited urls")
+        MODEL_ERRORS.pop("deepseek", None)
+        return text
+    except Exception as e:
+        print(f"DeepSeek error: {e}")
+        MODEL_ERRORS["deepseek"] = str(e)[:300]
+        return ""
+
+
+async def ask_ai_overview(prompt: str, country: str = "") -> str:
+    """The AI Overview Google shows for this query, via DataForSEO.
+
+    Not a model and not an API Google offers: a real search is run and the block
+    is parsed out of the page. Which means two things the other entries in the
+    registry do not have.
+
+    An empty answer here is ordinary, not a failure. Google shows an AI Overview
+    for only some queries — informational and longer ones most of all — so a
+    prompt that triggers none returns "". That is "no overview existed", not
+    "the overview did not name you", and the scoring already drops an empty
+    answer out of the denominator rather than counting it against the brand.
+
+    And the prompt is sent as a search query, because that is what it becomes.
+    A conversational prompt that reads well to a chat model may produce no
+    overview at all here; that is a fact about the query, and the audit should
+    show it rather than hide it.
+    """
+    if not AI_OVERVIEW_ENABLED:
+        MODEL_ERRORS["ai_overview"] = "disabled"
+        return ""
+    location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
+                auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+                json=[{"keyword": prompt,
+                       "location_name": location,
+                       "language_code": "en",
+                       "device": "desktop",
+                       # Without this the overview is missing from the response
+                       # even when Google shows one on the page.
+                       "load_async_ai_overview": True}],
+            )
+        if resp.status_code >= 400:
+            detail = f"{resp.status_code}: {resp.text[:200]}"
+            print(f"AI Overview error {detail}")
+            MODEL_ERRORS["ai_overview"] = detail
+            return ""
+        data = resp.json()
+
+        # DataForSEO reports per-task failures inside a 200, so the status code
+        # alone would read a quota problem as "no overview for this query".
+        tasks = data.get("tasks") or []
+        if not tasks:
+            MODEL_ERRORS["ai_overview"] = f"no tasks in response: {str(data)[:200]}"
+            return ""
+        task = tasks[0]
+        if task.get("status_code", 20000) >= 40000:
+            detail = f"{task.get('status_code')}: {task.get('status_message', '')[:200]}"
+            print(f"AI Overview task failed {detail}")
+            MODEL_ERRORS["ai_overview"] = detail
+            return ""
+
+        text, urls = _parse_ai_overview(task)
+        MODEL_ERRORS.pop("ai_overview", None)
+        if not text:
+            print(f"AI Overview: Google showed none for {prompt[:60]!r}")
+            return ""
+        if urls:
+            text += "\n\nSources: " + " ".join(urls)
+        print(f"AI Overview OK: {len(text)} chars, {len(urls)} references")
+        return text
+    except Exception as e:
+        print(f"AI Overview error: {e}")
+        MODEL_ERRORS["ai_overview"] = str(e)[:300]
+        return ""
+
+
+def _parse_ai_overview(task: dict) -> tuple[str, list[str]]:
+    """The overview's prose and the pages it cites, out of a SERP response.
+
+    Read defensively: this is a parsed page, not a documented model output, and
+    the shape changes when Google changes the block.
+    """
+    parts: list[str] = []
+    urls: list[str] = []
+    for result in (task.get("result") or []):
+        for item in ((result or {}).get("items") or []):
+            if not isinstance(item, dict) or item.get("type") != "ai_overview":
+                continue
+            for el in (item.get("items") or []):
+                if not isinstance(el, dict):
+                    continue
+                chunk = el.get("markdown") or el.get("text") or ""
+                if chunk:
+                    parts.append(chunk)
+                for link in (el.get("links") or []):
+                    if isinstance(link, dict) and str(link.get("url", "")).startswith("http"):
+                        urls.append(link["url"])
+            for ref in (item.get("references") or []):
+                if isinstance(ref, dict) and str(ref.get("url", "")).startswith("http"):
+                    urls.append(ref["url"])
+    return "\n\n".join(p for p in parts if p).strip(), list(dict.fromkeys(urls))
+
+
 def search_tool(country: str = "") -> dict:
     """Web search results are location-influenced, so the same query returns
     different sources in London and Moscow. Without this the audit measures
@@ -755,6 +935,8 @@ ASK.update({
     "chatgpt": lambda prompt, country: ask_openai(prompt, use_search=True, country=country),
     "gemini": lambda prompt, country: ask_gemini(prompt),
     "perplexity": lambda prompt, country: ask_perplexity(prompt, country=country),
+    "deepseek": lambda prompt, country: ask_deepseek(prompt, country=country),
+    "ai_overview": lambda prompt, country: ask_ai_overview(prompt, country=country),
 })
 assert set(ASK) == set(ALL_MODELS), (
     f"registry and ASK disagree: {set(ALL_MODELS) ^ set(ASK)}")
