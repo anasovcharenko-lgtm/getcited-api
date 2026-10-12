@@ -160,13 +160,41 @@ def url_matches_name(url: str, domain_hint: str, name: str) -> bool:
     slug = name_to_slug(name)
     return bool(slug) and slug in re.sub(r'[^a-z0-9]', '', domain)
 
+def join_list(items: list[str], conj: str = "or") -> str:
+    """"title, H1 or meta description". The conjunction is the caller's to choose,
+    because these lists sit inside sentences of opposite polarity: "not in the
+    title, H1 or meta description" needs "or", while "missing from the H1 and the
+    meta description" needs "and"."""
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + f" {conj} " + items[-1]
+
+
+def split_sources(text: str) -> tuple[str, list[str]]:
+    """The URLs the model actually cited, separated from the prose.
+
+    We append them ourselves (search_openai) so that link extraction sees every
+    source and not only the ones the model inlined. They used to be dropped on the
+    way to the screen, which left the one question a reader has - why was someone
+    else named and not me - answerable only by the CITED chips, which say nothing
+    about where the answer came from. Kept out of the answer body deliberately:
+    `discovered_brands` matches brand names against the answer text, and a bare
+    URL containing a brand's domain would otherwise read as a mention."""
+    if not text:
+        return "", []
+    parts = re.split(r'\n\nSources: ', text, maxsplit=1)
+    body = parts[0].strip()
+    urls = parts[1].split() if len(parts) > 1 else []
+    return body, list(dict.fromkeys(u for u in urls if u.startswith("http")))
+
+
 def trim_answer(text: str, limit: int = 3000) -> str:
     """Keep the real AI answer for display, but cap it so a multi-prompt audit
     doesn't balloon the payload. Cuts on a line boundary because these answers
     are markdown - slicing mid-table leaves a broken table on screen."""
     if not text:
         return ""
-    text = re.split(r'\n\nSources: ', text)[0].strip()
+    text, _ = split_sources(text)
     if len(text) <= limit:
         return text
     cut = text[:limit]
@@ -305,6 +333,23 @@ def selected_models(requested: list[str] | None) -> list[str]:
     want = {m.strip().lower() for m in requested if m and m.strip()}
     return [m for m in avail if m in want] or avail
 
+def _collect_gemini_urls(response) -> list[str]:
+    """Grounding citations, read defensively: the shape of this metadata has moved
+    between SDK versions, and a missing attribute must cost us the sources, not the
+    whole answer."""
+    urls: list[str] = []
+    try:
+        for cand in (getattr(response, "candidates", None) or []):
+            meta = getattr(cand, "grounding_metadata", None)
+            for chunk in (getattr(meta, "grounding_chunks", None) or []):
+                uri = getattr(getattr(chunk, "web", None), "uri", None)
+                if uri:
+                    urls.append(uri)
+    except Exception as e:
+        print(f"Gemini grounding metadata unreadable: {e}")
+    return list(dict.fromkeys(urls))
+
+
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_ENABLED:
         MODEL_ERRORS["gemini"] = "disabled"
@@ -316,7 +361,12 @@ async def ask_gemini(prompt: str) -> str:
             config={"tools": [{"google_search": {}}]}
         )
         text = response.text or ""
-        print(f"Gemini OK: {len(text)} chars")
+        # Same shape as the OpenAI path, so link extraction and the Sources list on
+        # screen do not have to know which model answered.
+        urls = _collect_gemini_urls(response)
+        if urls:
+            text += "\n\nSources: " + " ".join(urls)
+        print(f"Gemini OK: {len(text)} chars, {len(urls)} cited urls")
         return text
     except Exception as e:
         print(f"Gemini error: {e}")
@@ -1034,6 +1084,7 @@ async def run_audit(request: AuditRequest):
                 "competitors_with_link": g["competitors_with_link"],
                 "competitors_without_link": g["competitors_without_link"],
                 "answer": trim_answer(gemini_answer),
+                "sources": split_sources(gemini_answer)[1][:12],
                 "cited_domains": unique_domains(g["urls"]),
             },
             "chatgpt": {
@@ -1044,6 +1095,7 @@ async def run_audit(request: AuditRequest):
                 "competitors_with_link": o["competitors_with_link"],
                 "competitors_without_link": o["competitors_without_link"],
                 "answer": trim_answer(openai_answer),
+                "sources": split_sources(openai_answer)[1][:12],
                 "cited_domains": unique_domains(o["urls"]),
             },
         })
@@ -1582,7 +1634,26 @@ def check_self_declaration(place: dict, rivals: list[dict], brand: str,
 
     proposed_title = f"{brand} — {term}".strip(" —")
     if place["title"] and term:
-        proposed_title = f"{brand} — {term}: {place['title'].split('—')[-1].strip()}".rstrip(": ")
+        tail = place["title"].split("—")[-1].strip()
+        # Titles very often already end in the brand ("… — BATTLE START"). Carrying
+        # that tail over would print the brand twice in the suggested title, and the
+        # suggestion is meant to be pasted in as-is.
+        if tail and name_to_slug(tail) != name_to_slug(brand):
+            proposed_title = f"{brand} — {term}: {tail}"
+
+    # The term can be absent from the body as well as the three declarations, and
+    # then there is no contrast to draw: "appears 0 times in the body, but not in
+    # the title" asserts a difference between two absences.
+    n = place["body_occurrences"]
+    if n:
+        found = (f"'{term}' appears {n} time(s) in the body, "
+                 f"but not in the {join_list(missing, 'or')}.")
+    elif len(missing) == 3:
+        found = (f"'{term}' does not appear anywhere on the page — not in the "
+                 f"title, the H1, the meta description, or the body.")
+    else:
+        found = (f"'{term}' is missing from the {join_list(missing, 'and')}, "
+                 f"and does not appear in the body either.")
 
     return {
         "id": "self_declaration",
@@ -1593,8 +1664,7 @@ def check_self_declaration(place: dict, rivals: list[dict], brand: str,
         "facts": {"term": term, "body_occurrences": place["body_occurrences"],
                   "missing": missing},
         "title": "The page does not declare the category it competes in",
-        "found": (f"'{term}' appears {place['body_occurrences']} time(s) in the body, "
-                  f"but not in the {', '.join(missing)}."),
+        "found": found,
         "why": ("A model answering a category question matches on what the page declares "
                 "itself to be, not on how often a phrase occurs further down. Frequency in "
                 "body copy and case studies does not substitute for the title, the H1 and "
