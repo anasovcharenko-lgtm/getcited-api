@@ -300,18 +300,40 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
 GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
 
+# Perplexity. `sonar` is the cheap grounded model: a request fee plus tokens,
+# roughly $0.007 an answer, so a 50-prompt audit costs about 35 cents. It always
+# searches, which is why it belongs in the visibility score at all.
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "")
+PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar")
+PERPLEXITY_ENABLED = (os.getenv("PERPLEXITY_ENABLED", "false").lower() == "true"
+                      and bool(PERPLEXITY_API_KEY))
+
 # The registry. Every model the audit knows about is declared here once, in
 # display order, with the switch that says whether it can run at all.
 #
-# Adding a model means four edits and no more: a line here, its ask_* function,
-# one branch in run_prompt, and its block in the results loop. Availability,
-# per-audit selection, scoring and status all read from this registry, so a new
-# model gets its switch without anyone remembering to add one.
+# Adding a model means two edits: a line here and an ask_* function registered
+# in ASK. Availability, per-audit selection, how the prompt is put, scoring,
+# competitor counts and status all read from the registry, so a new model
+# cannot be added and then quietly left out of the numbers.
 MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "chatgpt": lambda: True,                 # no switch: without it there is no audit
     "gemini": lambda: GEMINI_ENABLED,
+    "perplexity": lambda: PERPLEXITY_ENABLED,
 }
 ALL_MODELS = list(MODEL_SWITCHES)
+
+# The exact model string each one answers with, read at request time rather than
+# at import: these are env vars, and a run has to record what actually answered.
+MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
+    "chatgpt": lambda: OPENAI_SEARCH_MODEL,
+    "gemini": lambda: GEMINI_MODEL,
+    "perplexity": lambda: PERPLEXITY_MODEL,
+}
+
+# How to ask each model. Filled in below as the ask_* functions are defined;
+# run_prompt reads this rather than naming models one by one, so a model added
+# to the registry is actually put to the question.
+ASK: dict[str, "callable"] = {}
 
 
 def available_models() -> list[str]:
@@ -372,6 +394,65 @@ async def ask_gemini(prompt: str) -> str:
         print(f"Gemini error: {e}")
         MODEL_ERRORS["gemini"] = str(e)[:300]
         return ""
+
+async def ask_perplexity(prompt: str, country: str = "") -> str:
+    """Perplexity always searches, so there is no tool to switch on.
+
+    The sources come back as structured fields rather than inside the prose, and
+    which field depends on the API version, so both are read and folded into the
+    same "Sources:" block the other models produce. Without that the answer would
+    reach the screen with no sources at all — Perplexity rarely inlines URLs.
+    """
+    if not PERPLEXITY_ENABLED:
+        MODEL_ERRORS["perplexity"] = "disabled"
+        return ""
+    try:
+        body: dict = {
+            "model": PERPLEXITY_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": MAX_ANSWER_TOKENS,
+        }
+        if country:
+            # Same reason as the OpenAI search tool: results are location
+            # influenced, and without this we measure Perplexity's default market
+            # rather than the client's.
+            body["web_search_options"] = {"user_location": {"country": country.upper()}}
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                         "Content-Type": "application/json"},
+                json=body,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+
+        urls: list[str] = []
+        for item in (data.get("search_results") or []):
+            if isinstance(item, dict) and item.get("url"):
+                urls.append(item["url"])
+        for u in (data.get("citations") or []):
+            if isinstance(u, str) and u.startswith("http"):
+                urls.append(u)
+        urls = list(dict.fromkeys(urls))
+        if urls:
+            text += "\n\nSources: " + " ".join(urls)
+
+        print(f"Perplexity OK: {len(text)} chars, {len(urls)} cited urls")
+        MODEL_ERRORS.pop("perplexity", None)
+        return text
+    except Exception as e:
+        detail = str(e)[:300]
+        # The body carries the reason an auth or quota failure happened; the
+        # status line alone just says 401.
+        if isinstance(e, httpx.HTTPStatusError):
+            detail = f"{e.response.status_code}: {e.response.text[:200]}"
+        print(f"Perplexity error: {detail}")
+        MODEL_ERRORS["perplexity"] = detail
+        return ""
+
 
 def search_tool(country: str = "") -> dict:
     """Web search results are location-influenced, so the same query returns
@@ -445,6 +526,23 @@ async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -
 
     MODEL_ERRORS["chatgpt"] = str(last_error)[:300]
     return ""
+
+
+# Every model takes (prompt, country) so run_prompt does not have to know which
+# one it is calling. Registered here, after the functions exist, and keyed by the
+# registry — a model declared in MODEL_SWITCHES with no entry here would be
+# selected, counted in the denominator and never asked anything, which is the
+# one failure mode the registry exists to prevent.
+ASK.update({
+    "chatgpt": lambda prompt, country: ask_openai(prompt, use_search=True, country=country),
+    "gemini": lambda prompt, country: ask_gemini(prompt),
+    "perplexity": lambda prompt, country: ask_perplexity(prompt, country=country),
+})
+assert set(ASK) == set(ALL_MODELS), (
+    f"registry and ASK disagree: {set(ALL_MODELS) ^ set(ASK)}")
+assert set(MODEL_VERSIONS) == set(ALL_MODELS), (
+    f"registry and MODEL_VERSIONS disagree: {set(ALL_MODELS) ^ set(MODEL_VERSIONS)}")
+
 
 async def enrich_brand(brand: str, description: str = "", website: str = "") -> dict:
     """Work out which market this brand competes in.
@@ -842,19 +940,27 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
     raw answer gives identical numbers — process_model already did that scan,
     and this just stops repeating it.
     """
-    gemini_mentions = sum(1 for r in results if r["gemini"]["mentioned"])
-    openai_mentions = sum(1 for r in results if r["chatgpt"]["mentioned"])
+    # Every count below runs over the models that actually answered. It used to
+    # run over the literal pair ("gemini", "chatgpt"), which meant a third model
+    # could be added, could answer, could name the brand — and appear in none of
+    # the numbers. The registry promises that adding a model takes four edits;
+    # this is what has to be true for that promise to hold.
+    counted = [m for m in running if m in ALL_MODELS]
+    per_model = {m: sum(1 for r in results if r.get(m, {}).get("mentioned"))
+                 for m in ALL_MODELS}
+    named_count = sum(per_model[m] for m in counted)
+
     # Divide by what was measured, not by what exists. Scoring a one-model run
     # as though two had answered would halve every client's visibility.
-    active_models = len(running)
+    active_models = len(counted)
     total_checks = len(results) * active_models
-    visibility_score = (int((gemini_mentions + openai_mentions) / total_checks * 100)
+    visibility_score = (int(named_count / total_checks * 100)
                         if total_checks > 0 else 0)
 
-    mentions_with_link_count = sum(1 for r in results for m in ("gemini", "chatgpt")
-                                   if r[m]["mentioned_with_link"])
-    mentions_without_link_count = sum(1 for r in results for m in ("gemini", "chatgpt")
-                                      if r[m]["mentioned_without_link"])
+    mentions_with_link_count = sum(1 for r in results for m in counted
+                                   if r.get(m, {}).get("mentioned_with_link"))
+    mentions_without_link_count = sum(1 for r in results for m in counted
+                                      if r.get(m, {}).get("mentioned_without_link"))
 
     def get_search_name(b):
         return extract_brand_from_url(b) if b.startswith("http") else b
@@ -864,27 +970,31 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         search_b = get_search_name(b)
         is_you = b == brand or b == clean_brand
         if is_you:
-            g = gemini_mentions
-            c = openai_mentions
+            by_model = dict(per_model)
             with_link = mentions_with_link_count
             without_link = mentions_without_link_count
         else:
-            g = sum(1 for r in results if search_b in r["gemini"]["competitors_found"])
-            c = sum(1 for r in results if search_b in r["chatgpt"]["competitors_found"])
-            with_link = sum(1 for r in results for m in ("gemini", "chatgpt")
-                            if search_b in r[m]["competitors_with_link"])
-            without_link = sum(1 for r in results for m in ("gemini", "chatgpt")
-                               if search_b in r[m]["competitors_without_link"])
+            by_model = {m: sum(1 for r in results
+                               if search_b in r.get(m, {}).get("competitors_found", []))
+                        for m in ALL_MODELS}
+            with_link = sum(1 for r in results for m in counted
+                            if search_b in r.get(m, {}).get("competitors_with_link", []))
+            without_link = sum(1 for r in results for m in counted
+                               if search_b in r.get(m, {}).get("competitors_without_link", []))
+        total = sum(by_model[m] for m in counted)
         competitor_stats.append({
             "name": search_b,
             "is_your_brand": is_you,
             # Carried through so the page check can compare this brand's page
             # with the pages of the rivals that actually get named.
             "domain": (brand_domain if is_you else competitor_domains.get(search_b, "")),
-            "gemini_mentions": g,
-            "chatgpt_mentions": c,
-            "total_mentions": g + c,
-            "mention_rate": round((g + c) / total_checks * 100, 1) if total_checks > 0 else 0,
+            # The named fields stay for stored runs and the existing dashboard;
+            # mentions_by_model is the one that grows with the registry.
+            "gemini_mentions": by_model.get("gemini", 0),
+            "chatgpt_mentions": by_model.get("chatgpt", 0),
+            "mentions_by_model": by_model,
+            "total_mentions": total,
+            "mention_rate": round(total / total_checks * 100, 1) if total_checks > 0 else 0,
             "mentions_with_link": with_link,
             "mentions_without_link": without_link,
         })
@@ -894,8 +1004,12 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
 
     return {
         "visibility_score": visibility_score,
-        "gemini_score": gemini_mentions,
-        "chatgpt_score": openai_mentions,
+        # Two models have a named field each because stored runs and the
+        # Supabase columns carry them. Everything beyond the pair lives in
+        # model_scores, which is what a new model gets for free.
+        "gemini_score": per_model.get("gemini", 0),
+        "chatgpt_score": per_model.get("chatgpt", 0),
+        "model_scores": {m: per_model[m] for m in counted},
         "total_prompts": len(results),
         "mentions_score": mentions_with_link_count,
         "citations_score": mentions_without_link_count,
@@ -1005,12 +1119,17 @@ async def run_audit(request: AuditRequest):
         return ""
 
     async def run_prompt(prompt):
-        gemini_answer, openai_answer = await asyncio.gather(
-            ask_gemini(prompt) if "gemini" in running else _skip(),
-            ask_openai(prompt, use_search=True, country=request.country)
-            if "chatgpt" in running else _skip()
-        )
-        return prompt, gemini_answer, openai_answer
+        """Every registered model, asked in parallel, keyed by name.
+
+        Was a two-element gather naming gemini and chatgpt. A model added to the
+        registry was then selected and counted but never actually asked, which
+        would have scored it as a silent zero for every prompt.
+        """
+        answers = await asyncio.gather(*[
+            ASK[m](prompt, request.country) if m in running else _skip()
+            for m in ALL_MODELS
+        ])
+        return prompt, dict(zip(ALL_MODELS, answers))
 
     prompt_results = await asyncio.gather(*[run_prompt(p) for p in prompts])
 
@@ -1040,7 +1159,13 @@ async def run_audit(request: AuditRequest):
         for u in urls:
             domain = extract_domain(u)
             if domain not in all_urls:
-                all_urls[domain] = {"url": u, "domain": domain, "gemini_count": 0, "chatgpt_count": 0, "total": 0, "prompt": prompt}
+                all_urls[domain] = {"url": u, "domain": domain, "total": 0,
+                                    "prompt": prompt,
+                                    # A counter per registered model. The two
+                                    # named ones are read by the stored-citation
+                                    # merge in /audit/extend, so they keep their
+                                    # keys whether or not those models ran.
+                                    **{f"{m}_count": 0 for m in ALL_MODELS}}
 
         return {
             "name_mentioned": name_mentioned,
@@ -1050,55 +1175,42 @@ async def run_audit(request: AuditRequest):
             "competitors_without_link": competitors_without_link,
         }
 
-    for prompt, gemini_answer, openai_answer in prompt_results:
-        g = process_model(prompt, gemini_answer, competitors)
-        o = process_model(prompt, openai_answer, competitors)
-
-        for u in g["urls"]:
-            domain = extract_domain(u)
-            all_urls[domain]["gemini_count"] += 1
-            all_urls[domain]["total"] += 1
-        for u in o["urls"]:
-            domain = extract_domain(u)
-            all_urls[domain]["chatgpt_count"] += 1
-            all_urls[domain]["total"] += 1
-
-        g_mentioned = g["name_mentioned"]
-        o_mentioned = o["name_mentioned"]
-        g_with_link = g_mentioned and g["has_own_link"]
-        o_with_link = o_mentioned and o["has_own_link"]
-
-        if not sample_quote and (g_mentioned or o_mentioned):
-            sample_quote = find_mention_sentence(gemini_answer, clean_brand) or find_mention_sentence(openai_answer, clean_brand)
-
-        results.append({
+    for prompt, answers in prompt_results:
+        # One block per registered model, built the same way for all of them.
+        # This used to be two hand-written blocks, which is why a third model
+        # could be asked a question and still appear nowhere in the output.
+        row: dict = {
             "prompt": prompt,
             "prompt_type": prompt_type_by_text.get(prompt, "comparison"),
-            "_gemini_raw": gemini_answer,
-            "_chatgpt_raw": openai_answer,
-            "gemini": {
-                "mentioned": g_mentioned,
-                "mentioned_with_link": g_with_link,
-                "mentioned_without_link": g_mentioned and not g_with_link,
-                "competitors_found": list(set(g["competitors_with_link"] + g["competitors_without_link"])),
-                "competitors_with_link": g["competitors_with_link"],
-                "competitors_without_link": g["competitors_without_link"],
-                "answer": trim_answer(gemini_answer),
-                "sources": split_sources(gemini_answer)[1][:12],
-                "cited_domains": unique_domains(g["urls"]),
-            },
-            "chatgpt": {
-                "mentioned": o_mentioned,
-                "mentioned_with_link": o_with_link,
-                "mentioned_without_link": o_mentioned and not o_with_link,
-                "competitors_found": list(set(o["competitors_with_link"] + o["competitors_without_link"])),
-                "competitors_with_link": o["competitors_with_link"],
-                "competitors_without_link": o["competitors_without_link"],
-                "answer": trim_answer(openai_answer),
-                "sources": split_sources(openai_answer)[1][:12],
-                "cited_domains": unique_domains(o["urls"]),
-            },
-        })
+        }
+        for m in ALL_MODELS:
+            answer = answers.get(m, "")
+            facts = process_model(prompt, answer, competitors)
+
+            for u in facts["urls"]:
+                domain = extract_domain(u)
+                all_urls[domain][f"{m}_count"] += 1
+                all_urls[domain]["total"] += 1
+
+            mentioned = facts["name_mentioned"]
+            with_link = mentioned and facts["has_own_link"]
+            if not sample_quote and mentioned:
+                sample_quote = find_mention_sentence(answer, clean_brand) or sample_quote
+
+            row[f"_{m}_raw"] = answer
+            row[m] = {
+                "mentioned": mentioned,
+                "mentioned_with_link": with_link,
+                "mentioned_without_link": mentioned and not with_link,
+                "competitors_found": list(set(facts["competitors_with_link"]
+                                              + facts["competitors_without_link"])),
+                "competitors_with_link": facts["competitors_with_link"],
+                "competitors_without_link": facts["competitors_without_link"],
+                "answer": trim_answer(answer),
+                "sources": split_sources(answer)[1][:12],
+                "cited_domains": unique_domains(facts["urls"]),
+            }
+        results.append(row)
 
     totals = aggregate_audit(results, running, brand, clean_brand, competitors,
                              competitor_domains, brand_domain)
@@ -1113,14 +1225,14 @@ async def run_audit(request: AuditRequest):
     if discovered:
         print(f"  discovered {len(discovered)} brand(s) nobody asked about: {', '.join(discovered)}")
         for r in results:
-            for model_key in ("chatgpt", "gemini"):
+            for model_key in ALL_MODELS:
                 answer = r[model_key].get("answer") or ""
                 r[model_key]["discovered_brands"] = [
                     d for d in discovered if brand_in_text(answer, d)
                 ]
     else:
         for r in results:
-            for model_key in ("chatgpt", "gemini"):
+            for model_key in ALL_MODELS:
                 r[model_key]["discovered_brands"] = []
 
     citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:10]
@@ -1134,9 +1246,11 @@ WHY: [one sentence]
 EFFORT: [Easy/Medium/Hard]
 Data: """ + summary)
 
+    # Raw answers are working data: they are large, and the payload is stored.
+    # Driven by the registry so a new model's raw text cannot be left behind.
     for r in results:
-        r.pop("_gemini_raw", None)
-        r.pop("_chatgpt_raw", None)
+        for m in ALL_MODELS:
+            r.pop(f"_{m}_raw", None)
 
     payload = {
         "brand": clean_brand,
@@ -1148,10 +1262,10 @@ Data: """ + summary)
         "country": (request.country or "US").upper(),
         "language": language,
         "run_at": datetime.now(timezone.utc).isoformat(),
-        "models_used": {
-            "chatgpt": OPENAI_SEARCH_MODEL,
-            "gemini": GEMINI_MODEL,
-        },
+        # Which exact model answered, so two runs made with different versions
+        # are not read as comparable. Registry-driven for the same reason as
+        # everything else here.
+        "models_used": {m: MODEL_VERSIONS[m]() for m in ALL_MODELS},
         "models_run": running,
         "models_available": available_models(),
         # Built from the registry, so a model added later reports its status
@@ -1188,7 +1302,7 @@ Data: """ + summary)
         },
     }
 
-    got_answers = any(r["chatgpt"].get("answer") or r["gemini"].get("answer") for r in results)
+    got_answers = any(r[m].get("answer") for r in results for m in running)
     if "chatgpt" not in MODEL_ERRORS and got_answers:
         AUDIT_CACHE[cache_key] = (asyncio.get_event_loop().time(), payload)
 
@@ -2168,13 +2282,19 @@ async def health_models():
     'low visibility' result apart from 'the model never answered'."""
     MODEL_ERRORS.clear()
     probe = "What is the best project management software? Name two tools."
-    gemini_text, openai_text = await asyncio.gather(
-        ask_gemini(probe),
-        ask_openai(probe, use_search=True),
-    )
+    # Every registered model, including the ones switched off — a disabled model
+    # reporting "disabled" here is the answer the endpoint exists to give.
+    texts = await asyncio.gather(*[ASK[m](probe, "") for m in ALL_MODELS])
     return {
-        "gemini": {"ok": bool(gemini_text), "chars": len(gemini_text), "model": GEMINI_MODEL, "error": MODEL_ERRORS.get("gemini")},
-        "chatgpt": {"ok": bool(openai_text), "chars": len(openai_text), "model": OPENAI_SEARCH_MODEL, "urls_found": len(extract_urls(openai_text)), "error": MODEL_ERRORS.get("chatgpt")},
+        m: {
+            "ok": bool(text),
+            "enabled": MODEL_SWITCHES[m](),
+            "chars": len(text),
+            "model": MODEL_VERSIONS[m](),
+            "urls_found": len(split_sources(text)[1]),
+            "error": MODEL_ERRORS.get(m),
+        }
+        for m, text in zip(ALL_MODELS, texts)
     }
 
 @app.get("/")
