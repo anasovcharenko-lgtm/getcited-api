@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dataclasses import dataclass
 from google import genai
 from openai import AsyncOpenAI
 import os
@@ -25,6 +26,133 @@ app.add_middleware(
 
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Who is calling
+#
+# Every endpoint below spends money: model calls, or fetching arbitrary pages.
+# None of them asked who was calling. The API URL sits in plain text in the
+# site's JavaScript bundle, CORS does not apply to anything that is not a
+# browser, and the one-audit limit was counted in the browser — so the limit was
+# a request, not a rule, and the spend had no ceiling at all.
+#
+# A caller is identified by the access token Supabase already issues to anyone
+# who signs in. The token is checked against Supabase rather than verified here,
+# which costs one fast request and means there is no signing secret to keep: the
+# two values below are the public URL and publishable key, the same pair that
+# ships in the frontend.
+#
+# REQUIRE_AUTH exists so this can be deployed without a broken window. The API
+# and the site deploy separately, and turning the check on before the site sends
+# tokens would 401 every audit, including yours. Ship both, then set it to true.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://djnvqoautxjyecfjuwhd.supabase.co").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "sb_publishable_kBgEq9htfHu_1_2Eon_3nQ_ZbNzIlqo")
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
+FREE_AUDIT_LIMIT = int(os.getenv("FREE_AUDIT_LIMIT", "1"))
+ADMIN_EMAILS = {e.strip().lower()
+                for e in os.getenv("ADMIN_EMAILS",
+                                   "anas.ovcharenko@gmail.com,anaovcharenko11@gmail.com").split(",")
+                if e.strip()}
+
+
+@dataclass
+class Caller:
+    id: str
+    email: str
+    token: str
+
+    @property
+    def is_admin(self) -> bool:
+        return self.email.lower() in ADMIN_EMAILS
+
+
+async def _supabase_user(token: str) -> dict | None:
+    """Ask Supabase who this token belongs to. None means it is not valid."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
+            )
+    except Exception as e:
+        print(f"auth: could not reach Supabase: {e}")
+        if REQUIRE_AUTH:
+            # Unreachable is not the same as invalid, and with the check on, a
+            # caller must not be let through on a network blip — this is a spend
+            # control, so it fails closed.
+            raise HTTPException(status_code=503, detail="Could not verify sign-in. Try again.")
+        return None
+    if r.status_code != 200:
+        return None
+    body = r.json()
+    return body if body.get("id") else None
+
+
+async def caller(authorization: str | None = Header(default=None)) -> Caller | None:
+    """The signed-in user, or None when the check is off and none was established.
+
+    REQUIRE_AUTH means one thing and only one: whether a request can be refused.
+    With it off nothing is ever blocked, including when Supabase cannot be
+    reached or the token is rejected — otherwise the flag meant to make the
+    deploy window safe would itself be able to break the site during it.
+    """
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+
+    if not token:
+        if REQUIRE_AUTH:
+            raise HTTPException(status_code=401, detail="Sign in to run this.")
+        print("auth: anonymous call (REQUIRE_AUTH is off)")
+        return None
+
+    user = await _supabase_user(token)
+    if not user:
+        if REQUIRE_AUTH:
+            # Wrong or expired either way; the client's move is the same.
+            raise HTTPException(status_code=401,
+                                detail="Your sign-in has expired. Sign in again.")
+        print("auth: token present but not accepted (REQUIRE_AUTH is off)")
+        return None
+    return Caller(id=user["id"], email=user.get("email") or "", token=token)
+
+
+async def audits_run_by(who: Caller) -> int:
+    """How many audits this account has already run.
+
+    Counted here rather than in the browser, which could simply be told not to
+    ask. Read with the caller's own token, so the row-level policy on `audits`
+    does the scoping and no service key is involved.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/audits",
+            params={"select": "id", "user_id": f"eq.{who.id}"},
+            headers={"Authorization": f"Bearer {who.token}", "apikey": SUPABASE_ANON_KEY,
+                     "Prefer": "count=exact", "Range": "0-0"},
+        )
+    if r.status_code >= 400:
+        print(f"quota: count failed {r.status_code}: {r.text[:200]}")
+        # Failing open here would make the limit optional for anyone who can
+        # make this query fail.
+        raise HTTPException(status_code=503, detail="Could not check your quota. Try again.")
+    total = (r.headers.get("content-range") or "").split("/")[-1]
+    return int(total) if total.isdigit() else 0
+
+
+async def within_quota(who: Caller | None = Depends(caller)) -> Caller | None:
+    """For the endpoint that starts a new audit. Admins are exempt."""
+    if who is None or who.is_admin:
+        return who
+    used = await audits_run_by(who)
+    if used >= FREE_AUDIT_LIMIT:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Free trial used ({used}/{FREE_AUDIT_LIMIT}). Upgrade to run more audits.")
+    return who
 
 class Competitor(BaseModel):
     name: str
@@ -873,7 +1001,7 @@ async def generate_prompts(brand: str, category: str,
 
     PROMPT_CACHE[cache_key] = prompts
     return prompts
-@app.post("/check-brand")
+@app.post("/check-brand", dependencies=[Depends(caller)])
 async def check_brand(request: dict):
     brand = request.get("brand", "")
     info = await enrich_brand(brand)
@@ -1018,7 +1146,7 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
 
 
 @app.post("/audit")
-async def run_audit(request: AuditRequest):
+async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_quota)):
     brand = request.brand
     # Both shapes collapse to: a list of names, plus domains where we know them.
     if request.competitor_list:
@@ -1322,7 +1450,7 @@ class ExtendRequest(AuditRequest):
     previous_citations: list[dict] = []
 
 
-@app.post("/audit/extend")
+@app.post("/audit/extend", dependencies=[Depends(caller)])
 async def extend_audit(request: ExtendRequest):
     new_prompts = [p.strip() for p in request.extra_prompts if p.strip()][:MAX_EXTRA_PROMPTS]
     previous = request.previous_results or []
@@ -1393,14 +1521,14 @@ async def extend_audit(request: ExtendRequest):
             "extended_at": datetime.now(timezone.utc).isoformat()}
 
 
-@app.post("/clear-cache")
+@app.post("/clear-cache", dependencies=[Depends(caller)])
 async def clear_cache():
     n = len(AUDIT_CACHE) + len(PROMPT_CACHE)
     AUDIT_CACHE.clear()
     PROMPT_CACHE.clear()
     return {"cleared": n}
 
-@app.get("/debug-prompt")
+@app.get("/debug-prompt", dependencies=[Depends(caller)])
 async def debug_prompt(q: str = "best AI visibility tracking tools", country: str = ""):
     try:
         response = await openai_client.responses.create(
@@ -1946,7 +2074,7 @@ async def _rival_profile(client, name: str, url: str, terms: list[str]) -> dict:
             "names_ai_crawlers": named}
 
 
-@app.post("/page-check")
+@app.post("/page-check", dependencies=[Depends(caller)])
 async def page_check(request: PageCheckRequest):
     """Why the models do not name this page, and the exact change to make.
 
@@ -2229,7 +2357,7 @@ class SourceGapRequest(BaseModel):
     brand_domain: str = ""
 
 
-@app.post("/source-gap")
+@app.post("/source-gap", dependencies=[Depends(caller)])
 async def source_gap(request: SourceGapRequest):
     urls = [u for u in dict.fromkeys(request.urls) if u.startswith("http")][:25]
     if not urls:
@@ -2276,7 +2404,7 @@ async def source_gap(request: SourceGapRequest):
     summary = {k: sum(1 for r in results if r["status"] == k)
                for k in ("absent", "present", "unreadable")}
     return {"results": results, "summary": summary}
-@app.get("/health-models")
+@app.get("/health-models", dependencies=[Depends(caller)])
 async def health_models():
     """Quick check of which AI models actually respond. Use this to tell a real
     'low visibility' result apart from 'the model never answered'."""
@@ -2299,4 +2427,6 @@ async def health_models():
 
 @app.get("/")
 def root():
-    return {"status": "GetCited API is running"}
+    # Open on purpose: a health check that needs a token is not a health check.
+    # Reporting whether the door is locked saves guessing after a deploy.
+    return {"status": "GetCited API is running", "auth_required": REQUIRE_AUTH}
