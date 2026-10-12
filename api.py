@@ -469,6 +469,31 @@ DATAFORSEO_LOCATIONS = {
 }
 DATAFORSEO_DEFAULT_LOCATION = os.getenv("DATAFORSEO_LOCATION", "United States")
 
+# How often the phrase is searched on Google. Billed per request rather than per
+# keyword, so the whole prompt set costs one call — about nine cents — and the
+# figure is a monthly average that barely moves, so it does not need refreshing
+# every audit.
+#
+# This is Google search volume, not prompt volume. Nobody sells prompt volume:
+# the model vendors do not publish it. It is a proxy for which prompts matter,
+# and the screen has to say which of the two it is showing.
+KEYWORD_VOLUME_ENABLED = (os.getenv("KEYWORD_VOLUME_ENABLED", "false").lower() == "true"
+                          and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
+
+# Hard limits from the API, not guesses: a keyword over either is rejected
+# rather than returned empty. Most conversational prompts fail the word count,
+# which is the real ceiling on how much of a set this can cover without an
+# agent rewriting the prompts into search phrases first.
+KEYWORD_MAX_WORDS = 10
+KEYWORD_MAX_CHARS = 80
+
+# Newest path first, legacy second: DataForSEO says to migrate off the old one,
+# and an account may be on either.
+KEYWORD_VOLUME_PATHS = [
+    "/v3/keywords_data/google_ads/search_volume/live",
+    "/v3/keywords_data/google/search_volume/live",
+]
+
 # The registry. Every model the audit knows about is declared here once, in
 # display order, with the switch that says whether it can run at all.
 #
@@ -753,6 +778,77 @@ async def ask_deepseek(prompt: str, country: str = "") -> str:
         print(f"DeepSeek error: {e}")
         MODEL_ERRORS["deepseek"] = str(e)[:300]
         return ""
+
+
+def keyword_eligible(prompt: str) -> bool:
+    """Whether this prompt can be asked about at all.
+
+    The API rejects anything over 80 characters or 10 words, so a long
+    conversational prompt is not "no data" — it never gets looked up. Checking
+    here rather than letting the call fail keeps one bad prompt from costing the
+    whole request.
+    """
+    p = (prompt or "").strip()
+    return bool(p) and len(p) <= KEYWORD_MAX_CHARS and len(p.split()) <= KEYWORD_MAX_WORDS
+
+
+async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
+    """Google search volume for the prompts that are short enough to ask about.
+
+    One request for the whole set, because billing is per request. Returns a map
+    keyed by the lowercased prompt — the API lowercases keywords, so matching the
+    response back to the prompt has to as well.
+
+    A prompt that is missing from the result, or carries a null volume, is left
+    out of the map entirely rather than stored as zero. Zero means "nobody
+    searches this", and that is a different statement from "Google has no data",
+    which is what a null actually means.
+    """
+    if not KEYWORD_VOLUME_ENABLED:
+        return {}
+    eligible = [p for p in prompts if keyword_eligible(p)]
+    if not eligible:
+        print("keyword volume: no prompt is short enough to look up")
+        return {}
+
+    location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
+    # language_code is deliberately not sent: DataForSEO warns that setting it
+    # makes Google return null volumes.
+    body = [{"keywords": eligible[:700], "location_name": location}]
+
+    for path in KEYWORD_VOLUME_PATHS:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(f"https://api.dataforseo.com{path}",
+                                         auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+                                         json=body)
+            if resp.status_code >= 400:
+                print(f"keyword volume {resp.status_code} on {path}: {resp.text[:200]}")
+                continue
+            data = resp.json()
+            task = (data.get("tasks") or [{}])[0]
+            if task.get("status_code", 20000) >= 40000:
+                print(f"keyword volume task failed: {task.get('status_code')} "
+                      f"{task.get('status_message', '')[:200]}")
+                continue
+
+            out: dict = {}
+            for item in (task.get("result") or []):
+                if not isinstance(item, dict):
+                    continue
+                kw = (item.get("keyword") or "").strip().lower()
+                vol = item.get("search_volume")
+                if kw and isinstance(vol, int):
+                    out[kw] = {"search_volume": vol,
+                               "competition": item.get("competition"),
+                               "cpc": item.get("cpc")}
+            print(f"keyword volume: {len(out)} of {len(eligible)} eligible prompts "
+                  f"have data ({len(prompts) - len(eligible)} too long to ask)")
+            return out
+        except Exception as e:
+            print(f"keyword volume error on {path}: {e}")
+            continue
+    return {}
 
 
 async def ask_ai_overview(prompt: str, country: str = "") -> str:
@@ -1548,7 +1644,12 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         ])
         return prompt, dict(zip(ALL_MODELS, answers))
 
-    prompt_results = await asyncio.gather(*[run_prompt(p) for p in prompts])
+    # The volume lookup is one request for the whole set and does not depend on
+    # the answers, so it runs alongside them rather than adding to the wait.
+    prompt_results, volumes = await asyncio.gather(
+        asyncio.gather(*[run_prompt(p) for p in prompts]),
+        keyword_volumes(prompts, request.country),
+    )
 
     results = []
     all_urls = {}
@@ -1600,6 +1701,12 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             "prompt": prompt,
             "prompt_type": prompt_type_by_text.get(prompt, "comparison"),
         }
+        # Absent when the phrase is too long to ask about or Google has no data
+        # for it. Absent, not zero: zero would claim nobody searches it.
+        vol = volumes.get(prompt.strip().lower())
+        if vol:
+            row["search_volume"] = vol["search_volume"]
+            row["keyword_source"] = "exact"   # the prompt itself, not a rewrite
         for m in ALL_MODELS:
             answer = answers.get(m, "")
             facts = process_model(prompt, answer, competitors)
@@ -1684,6 +1791,12 @@ Data: """ + summary)
         # are not read as comparable. Registry-driven for the same reason as
         # everything else here.
         "models_used": {m: MODEL_VERSIONS[m]() for m in ALL_MODELS},
+        "keyword_volume": {
+            "enabled": KEYWORD_VOLUME_ENABLED,
+            "with_data": sum(1 for r in results if r.get("search_volume") is not None),
+            "eligible": sum(1 for p in prompts if keyword_eligible(p)),
+            "total": len(prompts),
+        },
         "models_run": running,
         # What was asked, and what actually came back. A model can be in the
         # first list and absent from the second: selected, called, and silent.
