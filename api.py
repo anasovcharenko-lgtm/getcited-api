@@ -2566,6 +2566,24 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
         return {}
 
 
+@app.get("/markets", dependencies=[Depends(caller)])
+def markets():
+    """The markets keyword data can be asked for.
+
+    Served rather than hardcoded in the dashboard so there is one list. Every
+    other model list in this codebase was duplicated into the frontend at some
+    point, and every one of them drifted.
+    """
+    return {"markets": sorted(
+        ({"code": code,
+          "name": name,
+          "language": DATAFORSEO_LANGUAGES.get(code, DATAFORSEO_DEFAULT_LANGUAGE)}
+         for code, name in DATAFORSEO_LOCATIONS.items()
+         # UK and GB are the same place under two codes; keep the ISO one.
+         if code != "UK"),
+        key=lambda m: m["name"])}
+
+
 @app.post("/keyword-research", dependencies=[Depends(caller)])
 async def keyword_research(request: KeywordResearchRequest):
     """Volume and difficulty for a list of phrases, for planning work.
