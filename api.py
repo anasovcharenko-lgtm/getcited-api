@@ -469,6 +469,20 @@ DATAFORSEO_LOCATIONS = {
 }
 DATAFORSEO_DEFAULT_LOCATION = os.getenv("DATAFORSEO_LOCATION", "United States")
 
+# The SERP endpoint requires a language; the keyword-volume endpoint must not be
+# given one. Those are opposite rules on the same vendor, and treating them as
+# one rule is how the language got dropped from the SERP call and broke it.
+#
+# Derived from the market rather than from the audit's interface language: a
+# search in Germany is answered in German whichever language the dashboard is
+# in, and the overview we are measuring is the one a German buyer sees.
+DATAFORSEO_LANGUAGES = {
+    "US": "en", "GB": "en", "UK": "en", "CA": "en", "AU": "en", "IN": "en",
+    "RU": "ru", "KZ": "ru", "TR": "tr", "DE": "de", "FR": "fr", "ES": "es",
+    "IT": "it", "NL": "nl", "PL": "pl", "BR": "pt", "AE": "en",
+}
+DATAFORSEO_DEFAULT_LANGUAGE = os.getenv("DATAFORSEO_LANGUAGE", "en")
+
 # How often the phrase is searched on Google. Billed per request rather than per
 # keyword, so the whole prompt set costs one call — about nine cents — and the
 # figure is a monthly average that barely moves, so it does not need refreshing
@@ -910,6 +924,7 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
         MODEL_ERRORS["ai_overview"] = "disabled"
         return ""
     location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
+    language = DATAFORSEO_LANGUAGES.get((country or "").upper(), DATAFORSEO_DEFAULT_LANGUAGE)
     try:
         async with _dataforseo_gate:
             # Checked inside the gate, not before it: a prompt that waited its
@@ -923,6 +938,7 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
                     auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
                     json=[{"keyword": prompt,
                            "location_name": location,
+                           "language_code": language,
                            "device": "desktop",
                            # Without this the overview is missing from the
                            # response even when Google shows one on the page.
