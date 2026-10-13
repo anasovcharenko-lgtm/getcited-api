@@ -2502,6 +2502,119 @@ def check_js_rendered(facts: _PageFacts) -> dict | None:
 
 # ── endpoint ──
 
+class KeywordResearchRequest(BaseModel):
+    # One per line in the UI; split before it gets here.
+    keywords: list[str] = []
+    country: str = ""
+
+
+async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
+    """How hard each phrase is to rank for organically, 0-100.
+
+    A different number from the `competition` that comes with search volume:
+    that one counts advertisers bidding, this one estimates the chance of
+    reaching the organic top ten. They are routinely confused, and a tool that
+    shows one under the other's name is worse than a tool that shows neither.
+
+    This endpoint requires a language, unlike the volume one, which must not be
+    given one.
+    """
+    global _DATAFORSEO_LOCKED
+    if not KEYWORD_VOLUME_ENABLED or _DATAFORSEO_LOCKED or not keywords:
+        return {}
+    location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
+    language = DATAFORSEO_LANGUAGES.get((country or "").upper(), DATAFORSEO_DEFAULT_LANGUAGE)
+    try:
+        async with _dataforseo_gate:
+            if _DATAFORSEO_LOCKED:
+                return {}
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    "https://api.dataforseo.com/v3/dataforseo_labs/google/bulk_keyword_difficulty/live",
+                    auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+                    json=[{"keywords": keywords[:1000],
+                           "location_name": location,
+                           "language_code": language}],
+                )
+        if resp.status_code >= 400:
+            print(f"keyword difficulty {resp.status_code}: {resp.text[:200]}")
+            if resp.status_code in (401, 402, 403, 429):
+                _DATAFORSEO_LOCKED = f"{resp.status_code}: {resp.text[:200]}"
+            return {}
+        task = (resp.json().get("tasks") or [{}])[0]
+        if task.get("status_code", 20000) >= 40000:
+            print(f"keyword difficulty task failed: {task.get('status_code')} "
+                  f"{task.get('status_message', '')[:200]}")
+            if task.get("status_code") in DATAFORSEO_FATAL:
+                _DATAFORSEO_LOCKED = (f"{task.get('status_code')}: "
+                                      f"{task.get('status_message', '')[:200]}")
+            return {}
+        out: dict = {}
+        for result in (task.get("result") or []):
+            for item in ((result or {}).get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                kw = (item.get("keyword") or "").strip().lower()
+                kd = item.get("keyword_difficulty")
+                # Absent rather than zero: 0 is a real difficulty score meaning
+                # "trivial to rank for", not "we do not know".
+                if kw and isinstance(kd, int):
+                    out[kw] = kd
+        return out
+    except Exception as e:
+        print(f"keyword difficulty error: {e}")
+        return {}
+
+
+@app.post("/keyword-research", dependencies=[Depends(caller)])
+async def keyword_research(request: KeywordResearchRequest):
+    """Volume and difficulty for a list of phrases, for planning work.
+
+    Separate from an audit: this answers "is this phrase worth going after",
+    which is the question before "does a model name us for it".
+    """
+    seen, keywords = set(), []
+    for k in request.keywords:
+        k = (k or "").strip()
+        low = k.lower()
+        if k and low not in seen:
+            seen.add(low)
+            keywords.append(k)
+    if not keywords:
+        return {"error": "no keywords"}
+    if not KEYWORD_VOLUME_ENABLED:
+        return {"error": "keyword data is switched off",
+                "detail": "Set KEYWORD_VOLUME_ENABLED and the DataForSEO credentials."}
+
+    too_long = [k for k in keywords if not keyword_eligible(k)]
+    askable = [k for k in keywords if keyword_eligible(k)]
+
+    # Two endpoints, two prices, run together.
+    volumes, difficulty = await asyncio.gather(
+        keyword_volumes(askable, request.country),
+        keyword_difficulty(askable, request.country),
+    )
+
+    rows = []
+    for k in keywords:
+        low = k.strip().lower()
+        v = volumes.get(low) or {}
+        rows.append({
+            "keyword": k,
+            "search_volume": v.get("search_volume"),
+            "keyword_difficulty": difficulty.get(low),
+            "cpc": v.get("cpc"),
+            # Advertiser competition, kept under its own name so it is never
+            # read as ranking difficulty.
+            "ad_competition": v.get("competition"),
+            "too_long": k in too_long,
+        })
+    rows.sort(key=lambda r: (r["search_volume"] is None, -(r["search_volume"] or 0)))
+    return {"results": rows,
+            "country": (request.country or "US").upper(),
+            "error": _DATAFORSEO_LOCKED or ""}
+
+
 class PageCheckRequest(BaseModel):
     # The page to check. Not the domain: a loyalty product competes as a page.
     website: str
