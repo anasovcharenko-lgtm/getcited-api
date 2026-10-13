@@ -489,6 +489,31 @@ KEYWORD_MAX_CHARS = 80
 
 # Newest path first, legacy second: DataForSEO says to migrate off the old one,
 # and an account may be on either.
+# Once DataForSEO rejects or suspends the credentials, stop calling it.
+#
+# ask_ai_overview runs per prompt, so an audit of twenty prompts with a wrong
+# password fired twenty parallel rejected requests from a datacentre IP against
+# a days-old account. That is indistinguishable from credential stuffing, and
+# their risk system suspended the account for it — a self-inflicted outage
+# caused by retrying rather than by the wrong password itself.
+#
+# Any auth-shaped failure now latches, and the rest of the audit skips the call
+# entirely. It clears on restart, which a redeploy after fixing the credentials
+# provides anyway.
+_DATAFORSEO_LOCKED = ""
+
+# The latch alone does not help against a full fan-out: twenty prompts all start
+# before the first one fails, so all twenty requests go out anyway — measured,
+# not assumed. Limiting how many are in flight is what gives the latch something
+# to catch. It also suits what this is: a paid, rate-limited, fraud-monitored
+# SERP vendor rather than a model API built for parallel load.
+DATAFORSEO_CONCURRENCY = int(os.getenv("DATAFORSEO_CONCURRENCY", "3"))
+_dataforseo_gate = asyncio.Semaphore(DATAFORSEO_CONCURRENCY)
+
+# Auth and account-state failures, as opposed to "this query had no overview".
+# 40100 unauthorized, 40200 payment required, 40201 account suspended.
+DATAFORSEO_FATAL = {40100, 40101, 40200, 40201, 40202}
+
 KEYWORD_VOLUME_PATHS = [
     "/v3/keywords_data/google_ads/search_volume/live",
     "/v3/keywords_data/google/search_volume/live",
@@ -804,7 +829,8 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
     searches this", and that is a different statement from "Google has no data",
     which is what a null actually means.
     """
-    if not KEYWORD_VOLUME_ENABLED:
+    global _DATAFORSEO_LOCKED
+    if not KEYWORD_VOLUME_ENABLED or _DATAFORSEO_LOCKED:
         return {}
     eligible = [p for p in prompts if keyword_eligible(p)]
     if not eligible:
@@ -824,12 +850,22 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
                                          json=body)
             if resp.status_code >= 400:
                 print(f"keyword volume {resp.status_code} on {path}: {resp.text[:200]}")
+                if resp.status_code in (401, 402, 403, 429):
+                    # Not a wrong path — a refused account. Trying the other
+                    # path doubles the rejected attempts for no chance of
+                    # success.
+                    _DATAFORSEO_LOCKED = f"{resp.status_code}: {resp.text[:200]}"
+                    return {}
                 continue
             data = resp.json()
             task = (data.get("tasks") or [{}])[0]
             if task.get("status_code", 20000) >= 40000:
                 print(f"keyword volume task failed: {task.get('status_code')} "
                       f"{task.get('status_message', '')[:200]}")
+                if task.get("status_code") in DATAFORSEO_FATAL:
+                    _DATAFORSEO_LOCKED = (f"{task.get('status_code')}: "
+                                          f"{task.get('status_message', '')[:200]}")
+                    return {}
                 continue
 
             out: dict = {}
@@ -869,27 +905,36 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
     overview at all here; that is a fact about the query, and the audit should
     show it rather than hide it.
     """
+    global _DATAFORSEO_LOCKED
     if not AI_OVERVIEW_ENABLED:
         MODEL_ERRORS["ai_overview"] = "disabled"
         return ""
     location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
-                auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
-                json=[{"keyword": prompt,
-                       "location_name": location,
-                       "language_code": "en",
-                       "device": "desktop",
-                       # Without this the overview is missing from the response
-                       # even when Google shows one on the page.
-                       "load_async_ai_overview": True}],
-            )
+        async with _dataforseo_gate:
+            # Checked inside the gate, not before it: a prompt that waited its
+            # turn must see a refusal that arrived while it waited.
+            if _DATAFORSEO_LOCKED:
+                MODEL_ERRORS["ai_overview"] = _DATAFORSEO_LOCKED
+                return ""
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
+                    auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+                    json=[{"keyword": prompt,
+                           "location_name": location,
+                           "device": "desktop",
+                           # Without this the overview is missing from the
+                           # response even when Google shows one on the page.
+                           "load_async_ai_overview": True}],
+                )
         if resp.status_code >= 400:
             detail = f"{resp.status_code}: {resp.text[:200]}"
             print(f"AI Overview error {detail}")
             MODEL_ERRORS["ai_overview"] = detail
+            if resp.status_code in (401, 402, 403, 429):
+                _DATAFORSEO_LOCKED = detail
+                print("AI Overview: credentials refused, not calling again this run")
             return ""
         data = resp.json()
 
@@ -904,6 +949,11 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
             detail = f"{task.get('status_code')}: {task.get('status_message', '')[:200]}"
             print(f"AI Overview task failed {detail}")
             MODEL_ERRORS["ai_overview"] = detail
+            # A per-task failure about the account, not about this query, must
+            # stop the remaining prompts too.
+            if task.get("status_code") in DATAFORSEO_FATAL:
+                _DATAFORSEO_LOCKED = detail
+                print("AI Overview: account refused, not calling again this run")
             return ""
 
         text, urls = _parse_ai_overview(task)
