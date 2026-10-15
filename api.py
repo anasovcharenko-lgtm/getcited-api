@@ -832,6 +832,82 @@ def keyword_eligible(prompt: str) -> bool:
     return bool(p) and len(p) <= KEYWORD_MAX_CHARS and len(p.split()) <= KEYWORD_MAX_WORDS
 
 
+async def prompt_keywords(prompts: list[str], language: str = "") -> dict[str, list[str]]:
+    """Search phrases derived from conversational prompts.
+
+    Asking Google how often "how to increase the number of customers in a retail
+    chain" is searched returns nothing useful: it is too long for the API, and
+    where it does fit, nobody types it. The phrase a person would actually
+    search is shorter and flatter — "increase retail customers", "retail
+    customer retention". Those have volume; the prompt does not.
+
+    So the prompt is the thing we measure visibility on, and the derived phrase
+    is the thing we measure demand on. They are not the same string and the
+    response says which is which, because a volume shown against a prompt reads
+    as "this many people typed this", and that would be false.
+
+    Several phrases per prompt rather than one: a single phrase is a guess at
+    which wording wins, and the point of asking is not to guess. One model call
+    for the whole set — this is not worth a call per prompt.
+
+    Returns {} on any failure, which puts the caller back on exact prompts
+    rather than losing the column entirely.
+    """
+    usable = [p.strip() for p in prompts if p and p.strip()]
+    if not usable:
+        return {}
+
+    listing = "\n".join(f"{i+1}. {p}" for i, p in enumerate(usable))
+    lang_line = (f"Write the phrases in {language}.\n" if language else
+                 "Write each phrase in the same language as its prompt.\n")
+    instruction = (
+        "Turn each conversational prompt below into the search phrases a person "
+        "would actually type into Google when they want the same thing.\n\n"
+        "Rules:\n"
+        "- 2 to 3 phrases per prompt\n"
+        "- each phrase 2 to 5 words, never a single word\n"
+        "- drop filler: how, what, best, my, the, a\n"
+        "- keep the product category in the phrase\n"
+        "- no brand names unless the prompt names one\n"
+        + lang_line +
+        "\nAnswer with one line per prompt, in this exact format and nothing "
+        "else:\n1. phrase one | phrase two | phrase three\n\n"
+        f"Prompts:\n{listing}"
+    )
+
+    try:
+        raw = await ask_openai(instruction, use_search=False)
+    except Exception as e:
+        print(f"keyword derivation failed: {e}")
+        return {}
+    if not raw.strip():
+        print("keyword derivation returned nothing — falling back to exact prompts")
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        num, _, rest = line.partition(".")
+        if not num.strip().isdigit() or not rest.strip():
+            continue
+        idx = int(num.strip()) - 1
+        if not 0 <= idx < len(usable):
+            continue
+        phrases = []
+        for part in rest.split("|"):
+            # The model is told 2-5 words; the API's own limits are the ones
+            # that actually matter, so they are enforced here rather than
+            # trusted there.
+            part = part.strip().strip('"').lower()
+            if part and keyword_eligible(part) and part not in phrases:
+                phrases.append(part)
+        if phrases:
+            out[usable[idx]] = phrases[:3]
+
+    print(f"keyword derivation: phrases for {len(out)} of {len(usable)} prompts")
+    return out
+
+
 async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
     """Google search volume for the prompts that are short enough to ask about.
 
@@ -1528,8 +1604,17 @@ def cluster_stats(results: list[dict], counted: list[str]) -> list[dict]:
                     if r.get(m, {}).get("mentioned"))
         mention_rate = round(named / answers * 100, 1) if answers else None
 
-        vols = [r["search_volume"] for r in rows
-                if isinstance(r.get("search_volume"), int)]
+        # Deduplicated by phrase, not by prompt. Two prompts in a cluster often
+        # derive the same search phrase — "increase retail customers" can serve
+        # three different questions — and counting it once per prompt would sell
+        # the same demand three times. The figure has to describe searches, not
+        # rows on our screen.
+        by_phrase: dict[str, int] = {}
+        for r in rows:
+            v = r.get("search_volume")
+            if isinstance(v, int):
+                by_phrase[r.get("keyword_phrase") or r.get("prompt", "")] = v
+        vols = list(by_phrase.values())
         avg = round(sum(vols) / len(vols)) if vols else None
 
         # Average monthly demand in this cluster that the brand is currently not
@@ -1548,7 +1633,15 @@ def cluster_stats(results: list[dict], counted: list[str]) -> list[dict]:
             "answers": answers,
             "named": named,
             "mention_rate": mention_rate,
-            "with_volume": len(vols),
+            # Two different counts, because they answer two different questions
+            # and one name for both would be a lie in one of them.
+            #   with_volume    — prompts that got a figure, which is the
+            #                    coverage the screen has to confess to
+            #   unique_phrases — distinct search phrases behind those figures,
+            #                    which is what the sum and the average are over
+            "with_volume": sum(1 for r in rows
+                               if isinstance(r.get("search_volume"), int)),
+            "unique_phrases": len(vols),
             "search_volume_avg": avg,
             "search_volume_total": sum(vols) if vols else None,
             "missed_demand": missed,
@@ -1786,11 +1879,28 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         ])
         return prompt, dict(zip(ALL_MODELS, answers))
 
-    # The volume lookup is one request for the whole set and does not depend on
-    # the answers, so it runs alongside them rather than adding to the wait.
-    prompt_results, volumes = await asyncio.gather(
+    async def demand() -> tuple[dict, dict]:
+        """Derive searchable phrases, then price the whole set in one request.
+
+        Two steps, one after the other, but the pair still runs alongside the
+        answers — and the answers take far longer, so this costs no wall time.
+
+        Prompts with no derived phrase are asked about as themselves. That is
+        rarely useful, but it is the difference between an empty column and a
+        column with a few exact matches in it, and the row says which it got.
+        """
+        if not KEYWORD_VOLUME_ENABLED:
+            return {}, {}
+        derived = await prompt_keywords(prompts, request.language)
+        phrases = sorted({p for ps in derived.values() for p in ps})
+        fallback = [p.strip().lower() for p in prompts if p not in derived]
+        return derived, await keyword_volumes(phrases + fallback, request.country)
+
+    # The volume work does not depend on the answers, so it runs alongside them
+    # rather than adding to the wait.
+    prompt_results, (derived, volumes) = await asyncio.gather(
         asyncio.gather(*[run_prompt(p) for p in prompts]),
-        keyword_volumes(prompts, request.country),
+        demand(),
     )
 
     results = []
@@ -1843,12 +1953,32 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             "prompt": prompt,
             "prompt_type": prompt_type_by_text.get(prompt, "comparison"),
         }
-        # Absent when the phrase is too long to ask about or Google has no data
-        # for it. Absent, not zero: zero would claim nobody searches it.
-        vol = volumes.get(prompt.strip().lower())
-        if vol:
-            row["search_volume"] = vol["search_volume"]
-            row["keyword_source"] = "exact"   # the prompt itself, not a rewrite
+        # Absent when there was no phrase to ask about or Google has no data for
+        # it. Absent, not zero: zero would claim nobody searches it.
+        #
+        # The derived phrase is preferred over the prompt because the prompt is
+        # a sentence and the phrase is what people type. When several phrases
+        # came back, the busiest one wins — the question is whether there is
+        # demand behind this prompt, and the best phrase answers it.
+        best = None
+        for phrase in derived.get(prompt, []):
+            v = volumes.get(phrase)
+            if v and isinstance(v.get("search_volume"), int):
+                if best is None or v["search_volume"] > best[1]:
+                    best = (phrase, v["search_volume"])
+        if best:
+            row["search_volume"] = best[1]
+            row["keyword_phrase"] = best[0]
+            # Says this number belongs to a rewrite, not to the prompt. Without
+            # it the screen would read as "this many people typed this prompt",
+            # which is false for every row here.
+            row["keyword_source"] = "derived"
+        else:
+            vol = volumes.get(prompt.strip().lower())
+            if vol and isinstance(vol.get("search_volume"), int):
+                row["search_volume"] = vol["search_volume"]
+                row["keyword_phrase"] = prompt.strip().lower()
+                row["keyword_source"] = "exact"   # the prompt itself
         for m in ALL_MODELS:
             answer = answers.get(m, "")
             facts = process_model(prompt, answer, competitors)
