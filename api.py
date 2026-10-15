@@ -121,6 +121,34 @@ async def caller(authorization: str | None = Header(default=None)) -> Caller | N
     return Caller(id=user["id"], email=user.get("email") or "", token=token)
 
 
+# Keyword lookups are not free: two DataForSEO endpoints per call, about ten
+# cents, billed whoever asked and however many phrases were in it. Until that is
+# part of a plan somebody pays for, only the owner can spend it.
+#
+# One variable opens it later without a code change.
+KEYWORDS_ADMIN_ONLY = os.getenv("KEYWORDS_ADMIN_ONLY", "true").lower() == "true"
+
+
+async def admin_only(who: Caller | None = Depends(caller)) -> Caller | None:
+    """Owner-only access to a paid endpoint.
+
+    This deliberately fails closed where `caller` fails open. REQUIRE_AUTH is
+    about whether a deploy window can refuse anybody, so with it off `caller`
+    returns None rather than blocking — which is right for an audit and wrong
+    here. If turning off a flag meant for a deploy window also opened a metered
+    vendor endpoint to the internet, that flag would be a billing incident
+    waiting to happen.
+
+    So: no caller, or a caller who is not an admin, is refused either way.
+    """
+    if not KEYWORDS_ADMIN_ONLY:
+        return who
+    if who is None or not who.is_admin:
+        raise HTTPException(status_code=403,
+                            detail="Keyword research is not open yet.")
+    return who
+
+
 async def audits_run_by(who: Caller) -> int:
     """How many audits this account has already run.
 
@@ -2772,7 +2800,7 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
         return {}
 
 
-@app.get("/markets", dependencies=[Depends(caller)])
+@app.get("/markets", dependencies=[Depends(admin_only)])
 def markets():
     """The markets keyword data can be asked for.
 
@@ -2790,7 +2818,7 @@ def markets():
         key=lambda m: m["name"])}
 
 
-@app.post("/keyword-research", dependencies=[Depends(caller)])
+@app.post("/keyword-research", dependencies=[Depends(admin_only)])
 async def keyword_research(request: KeywordResearchRequest):
     """Volume and difficulty for a list of phrases, for planning work.
 
