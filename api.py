@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dataclasses import dataclass
+from collections import defaultdict
 from google import genai
 from openai import AsyncOpenAI
 import os
@@ -1488,6 +1489,77 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
     return found[:12]
 
 
+def cluster_stats(results: list[dict], counted: list[str]) -> list[dict]:
+    """Demand and visibility, side by side, per intent cluster.
+
+    The question this answers is the one neither number answers alone: where is
+    there real demand that we are invisible for. A cluster with heavy demand and
+    a high mention rate needs defending, not work; a cluster with no demand is
+    not worth winning however badly we lose it.
+
+    `prompt_type` is the cluster. It is already assigned to every prompt, and on
+    a twenty-prompt audit it is the right grain — clustering twenty phrases by
+    their words would produce groups of two, which is noise with a label on it.
+
+    Two separate coverages live here and must never be collapsed into one word:
+
+      - `with_volume` is how many prompts Google had a figure for. Volume is
+        only asked for phrases inside the API's 10-word / 80-character limits,
+        so this is usually a fraction of the cluster.
+      - `mention_rate` is how often the brand was named, over answers received.
+
+    This is why the sum is reported next to the average rather than instead of
+    it. A sum scales with how many prompts happened to fit the length limit, so
+    a cluster of short comparison queries outranks a cluster of long problem
+    queries on eligibility alone. The average does not move with that, which is
+    what makes the two clusters comparable at all.
+    """
+    by_type: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        by_type[r.get("prompt_type") or "other"].append(r)
+
+    out = []
+    for name, rows in by_type.items():
+        # Same denominator rule as the headline score: answers received, never
+        # prompts times models asked.
+        answers = sum(1 for r in rows for m in counted
+                      if (r.get(m, {}).get("answer") or "").strip())
+        named = sum(1 for r in rows for m in counted
+                    if r.get(m, {}).get("mentioned"))
+        mention_rate = round(named / answers * 100, 1) if answers else None
+
+        vols = [r["search_volume"] for r in rows
+                if isinstance(r.get("search_volume"), int)]
+        avg = round(sum(vols) / len(vols)) if vols else None
+
+        # Average monthly demand in this cluster that the brand is currently not
+        # named for. Stated as one sentence on purpose: a figure nobody can
+        # explain in a sentence is a figure nobody should sort by.
+        #
+        # It inherits the volume coverage above — with two prompts out of eight
+        # carrying a number, this describes those two. The UI has to show the
+        # coverage next to it, which is why both are returned.
+        missed = (round(avg * (1 - mention_rate / 100))
+                  if avg is not None and mention_rate is not None else None)
+
+        out.append({
+            "cluster": name,
+            "prompts": len(rows),
+            "answers": answers,
+            "named": named,
+            "mention_rate": mention_rate,
+            "with_volume": len(vols),
+            "search_volume_avg": avg,
+            "search_volume_total": sum(vols) if vols else None,
+            "missed_demand": missed,
+        })
+
+    # Clusters without a single volume figure sort last rather than as zero:
+    # unknown demand is not absent demand.
+    out.sort(key=lambda c: (c["missed_demand"] is None, -(c["missed_demand"] or 0)))
+    return out
+
+
 def aggregate_audit(results: list[dict], running: list[str], brand: str,
                     clean_brand: str, competitors: list[str],
                     competitor_domains: dict, brand_domain: str) -> dict:
@@ -1593,6 +1665,10 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         "mentions_score": mentions_with_link_count,
         "citations_score": mentions_without_link_count,
         "competitor_ranking": competitor_stats,
+        # Where demand and invisibility overlap. Computed here rather than on
+        # screen so an extended audit and a fresh one cannot disagree about it,
+        # for the same reason everything else in this function lives here.
+        "clusters": cluster_stats(results, counted),
     }
 
 
