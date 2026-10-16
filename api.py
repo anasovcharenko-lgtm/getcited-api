@@ -1678,6 +1678,64 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
     return found[:12]
 
 
+def share_of_voice(results: list[dict], counted: list[str], clean_brand: str,
+                   competitors: list[str]) -> dict:
+    """Each brand's share of every naming event in the answers.
+
+    Visibility says how often this brand was named. Share of voice says how much
+    of the conversation it held, which is a different question: a brand named in
+    half the answers looks strong until the other half named four rivals each.
+
+    The denominator is every brand the models actually named — the tracked list,
+    this brand, and the ones discovered in the answers that nobody asked about.
+    Dividing by the tracked list alone would be the flattering version: add a
+    competitor to the form and everyone's share drops, which would mean the
+    number measured our form rather than the market.
+
+    Counted in naming events, not prompts. A brand named by three models for the
+    same question held three slots, and the denominator counts the same way.
+
+    Returns `total: 0` when nobody was named at all. The caller must not render
+    that as 0% — a share of nothing is undefined, not zero, and the two look
+    identical once they reach a screen.
+    """
+    counts: dict[str, int] = {}
+
+    counts[clean_brand] = sum(1 for r in results for m in counted
+                              if r.get(m, {}).get("mentioned"))
+
+    for name in competitors:
+        counts[name] = sum(1 for r in results for m in counted
+                           if name in (r.get(m, {}).get("competitors_found") or []))
+
+    # Whatever the models brought up unprompted. Absent on a run stored before
+    # discovery existed, which simply leaves those brands out rather than
+    # breaking the sum.
+    for r in results:
+        for m in counted:
+            for name in (r.get(m, {}).get("discovered_brands") or []):
+                if name not in counts:
+                    counts[name] = 0
+    for name in list(counts):
+        if name == clean_brand or name in competitors:
+            continue
+        counts[name] = sum(1 for r in results for m in counted
+                           if name in (r.get(m, {}).get("discovered_brands") or []))
+
+    total = sum(counts.values())
+    rows = [{"name": n,
+             "mentions": c,
+             "is_your_brand": n == clean_brand,
+             "share": round(c / total * 100, 1) if total else None}
+            for n, c in counts.items()]
+    rows.sort(key=lambda x: (-x["mentions"], x["name"]))
+
+    return {"total": total,
+            "yours": rows[0]["share"] if total and rows and rows[0]["is_your_brand"]
+                     else next((r["share"] for r in rows if r["is_your_brand"]), None),
+            "brands": rows}
+
+
 def cluster_stats(results: list[dict], counted: list[str]) -> list[dict]:
     """Demand and visibility, side by side, per intent cluster.
 
@@ -1875,6 +1933,7 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         # screen so an extended audit and a fresh one cannot disagree about it,
         # for the same reason everything else in this function lives here.
         "clusters": cluster_stats(results, counted),
+        "share_of_voice": share_of_voice(results, counted, clean_brand, competitors),
     }
 
 
@@ -2121,16 +2180,10 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             }
         results.append(row)
 
-    totals = aggregate_audit(results, running, brand, clean_brand, competitors,
-                             competitor_domains, brand_domain)
-    gemini_mentions = totals["gemini_score"]
-    openai_mentions = totals["chatgpt_score"]
-    visibility_score = totals["visibility_score"]
-    answers_count = totals["answers"]
-    mentions_with_link_count = totals["mentions_score"]
-    mentions_without_link_count = totals["citations_score"]
-    competitor_stats = totals["competitor_ranking"]
-
+    # Discovery runs before aggregation because share of voice divides by every
+    # brand the models named, and a brand nobody thought to track is still a
+    # brand that took the slot. Dividing by the tracked list alone would flatter
+    # everyone in it, this brand included.
     discovered = await discover_brands(results, competitors + [clean_brand], category)
     if discovered:
         print(f"  discovered {len(discovered)} brand(s) nobody asked about: {', '.join(discovered)}")
@@ -2144,6 +2197,17 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         for r in results:
             for model_key in ALL_MODELS:
                 r[model_key]["discovered_brands"] = []
+
+    totals = aggregate_audit(results, running, brand, clean_brand, competitors,
+                             competitor_domains, brand_domain)
+    gemini_mentions = totals["gemini_score"]
+    openai_mentions = totals["chatgpt_score"]
+    visibility_score = totals["visibility_score"]
+    answers_count = totals["answers"]
+    mentions_with_link_count = totals["mentions_score"]
+    mentions_without_link_count = totals["citations_score"]
+    competitor_stats = totals["competitor_ranking"]
+
 
     citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:10]
     summary = "Brand: " + clean_brand + ", Category: " + category + ", Score: " + str(visibility_score) + "%"
@@ -2206,6 +2270,7 @@ Data: """ + summary)
         # its fields one by one, and a field nobody names is a field nobody
         # sends. The guard below exists so the next one cannot do that quietly.
         "clusters": totals["clusters"],
+        "share_of_voice": totals["share_of_voice"],
         "gemini_score": gemini_mentions,
         "chatgpt_score": openai_mentions,
         "total_prompts": len(prompts),
