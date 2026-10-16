@@ -976,21 +976,40 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
 
     code = (country or "").upper()
     location = DATAFORSEO_LOCATIONS.get(code, DATAFORSEO_DEFAULT_LOCATION)
-    # language_code is deliberately not sent: DataForSEO warns that setting it
-    # makes Google return null volumes.
-    #
-    # The place is named two ways, tried in order, for the same reason the
-    # Perplexity shapes are a list: the numeric code is what this endpoint
-    # actually wants, and the name is kept behind it so a market missing from
-    # the code map still gets its old behaviour rather than nothing.
-    locations: list[dict] = []
-    if DATAFORSEO_LOCATION_CODES.get(code):
-        locations.append({"location_code": DATAFORSEO_LOCATION_CODES[code]})
-    locations.append({"location_name": location})
+    loc_code = DATAFORSEO_LOCATION_CODES.get(code)
+    language = DATAFORSEO_LANGUAGES.get(code, DATAFORSEO_DEFAULT_LANGUAGE)
 
-    # Flattened rather than nested so the body below keeps one level of
-    # indentation and its `continue`s keep meaning what they did.
-    attempts = [(path, place) for path in KEYWORD_VOLUME_PATHS for place in locations]
+    # Request shapes, most likely first, tried until one answers.
+    #
+    # Production said `40501 Invalid Field: 'location_name'` AND
+    # `40501 Invalid Field: 'location_code'` for the same endpoint, which rules
+    # out the naming of the place as the cause: both spellings were refused.
+    # What every refused body had in common was no language. This endpoint wants
+    # the pair, and its validator complains about the first field it reaches.
+    #
+    # The comment that used to sit here said language_code was withheld on
+    # purpose because DataForSEO warns it makes Google return nulls. That
+    # warning belongs to a different endpoint, and obeying it here cost the
+    # whole column. A null volume is a row we drop; an invalid request is every
+    # row gone.
+    #
+    # Keeping the languageless shapes at the bottom rather than deleting them:
+    # if the pair is ever wrong for some market, the old behaviour is still
+    # reachable instead of the column vanishing again.
+    shapes: list[dict] = []
+    if loc_code:
+        shapes.append({"location_code": loc_code, "language_code": language})
+    shapes.append({"location_name": location, "language_code": language})
+    if loc_code:
+        shapes.append({"location_code": loc_code})
+    shapes.append({"location_name": location})
+
+    # Every rejected attempt is still a request from a datacentre IP, and this
+    # account has been suspended once for exactly that. So the ladder is climbed
+    # on the current endpoint only, and the legacy path gets a single try with
+    # the best shape rather than a second full sweep.
+    attempts = [(KEYWORD_VOLUME_PATHS[0], s) for s in shapes]
+    attempts += [(p, shapes[0]) for p in KEYWORD_VOLUME_PATHS[1:]]
 
     for path, place in attempts:
         body = [{"keywords": eligible[:700], **place}]
