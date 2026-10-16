@@ -562,6 +562,24 @@ KEYWORD_VOLUME_PATHS = [
     "/v3/keywords_data/google/search_volume/live",
 ]
 
+# Google Ads keeps its own list of places, separate from the one the SERP
+# endpoints use, and the names in it do not all match. Sending `location_name:
+# "Russia"` to the volume endpoint returns `40501 Invalid Field:
+# 'location_name'` while the identical string works for SERP — which is what it
+# did in production, silently emptying the volume column.
+#
+# The numeric code has no such problem. For a country it is Google's geo target
+# criteria ID, which is 2000 + the ISO 3166-1 numeric code: the United States is
+# 840 and 2840, Russia is 643 and 2643.
+#
+# Kept to the markets DATAFORSEO_LOCATIONS already offers, so the two maps
+# cannot disagree about which places exist.
+DATAFORSEO_LOCATION_CODES = {
+    "US": 2840, "GB": 2826, "UK": 2826, "CA": 2124, "AU": 2036, "IN": 2356,
+    "RU": 2643, "KZ": 2398, "TR": 2792, "DE": 2276, "FR": 2250, "ES": 2724,
+    "IT": 2380, "NL": 2528, "PL": 2616, "BR": 2076, "AE": 2784,
+}
+
 # The registry. Every model the audit knows about is declared here once, in
 # display order, with the switch that says whether it can run at all.
 #
@@ -956,19 +974,33 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
         print("keyword volume: no prompt is short enough to look up")
         return {}
 
-    location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
+    code = (country or "").upper()
+    location = DATAFORSEO_LOCATIONS.get(code, DATAFORSEO_DEFAULT_LOCATION)
     # language_code is deliberately not sent: DataForSEO warns that setting it
     # makes Google return null volumes.
-    body = [{"keywords": eligible[:700], "location_name": location}]
+    #
+    # The place is named two ways, tried in order, for the same reason the
+    # Perplexity shapes are a list: the numeric code is what this endpoint
+    # actually wants, and the name is kept behind it so a market missing from
+    # the code map still gets its old behaviour rather than nothing.
+    locations: list[dict] = []
+    if DATAFORSEO_LOCATION_CODES.get(code):
+        locations.append({"location_code": DATAFORSEO_LOCATION_CODES[code]})
+    locations.append({"location_name": location})
 
-    for path in KEYWORD_VOLUME_PATHS:
+    # Flattened rather than nested so the body below keeps one level of
+    # indentation and its `continue`s keep meaning what they did.
+    attempts = [(path, place) for path in KEYWORD_VOLUME_PATHS for place in locations]
+
+    for path, place in attempts:
+        body = [{"keywords": eligible[:700], **place}]
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(f"https://api.dataforseo.com{path}",
                                          auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
                                          json=body)
             if resp.status_code >= 400:
-                print(f"keyword volume {resp.status_code} on {path}: {resp.text[:200]}")
+                print(f"keyword volume {resp.status_code} on {path} with {place}: {resp.text[:200]}")
                 if resp.status_code in (401, 402, 403, 429):
                     # Not a wrong path — a refused account. Trying the other
                     # path doubles the rejected attempts for no chance of
@@ -979,7 +1011,8 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
             data = resp.json()
             task = (data.get("tasks") or [{}])[0]
             if task.get("status_code", 20000) >= 40000:
-                print(f"keyword volume task failed: {task.get('status_code')} "
+                print(f"keyword volume task failed on {path} with {place}: "
+                      f"{task.get('status_code')} "
                       f"{task.get('status_message', '')[:200]}")
                 if task.get("status_code") in DATAFORSEO_FATAL:
                     _DATAFORSEO_LOCKED = (f"{task.get('status_code')}: "
@@ -998,7 +1031,8 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
                                "competition": item.get("competition"),
                                "cpc": item.get("cpc")}
             print(f"keyword volume: {len(out)} of {len(eligible)} eligible prompts "
-                  f"have data ({len(prompts) - len(eligible)} too long to ask)")
+                  f"have data ({len(prompts) - len(eligible)} too long to ask) "
+                  f"via {path} with {place}")
             return out
         except Exception as e:
             print(f"keyword volume error on {path}: {e}")
