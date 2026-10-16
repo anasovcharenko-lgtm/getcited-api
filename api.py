@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 import httpx
 load_dotenv()
 
@@ -2538,6 +2538,13 @@ class _PageFacts(HTMLParser):
         self.title = ""
         self.meta_description = ""
         self.meta_robots = ""
+        self.canonical = ""
+        # Filled in by the fetcher, not the parser: both come from the response
+        # rather than the markup, and both change what the markup means. A
+        # canonical is judged against the URL that actually answered, and
+        # X-Robots-Tag says noindex just as loudly as the meta tag does.
+        self.final_url = ""
+        self.x_robots_tag = ""
         self.headings: list[tuple[str, str]] = []     # (tag, text)
         self.jsonld: list[str] = []
         self.body_parts: list[str] = []
@@ -2553,6 +2560,11 @@ class _PageFacts(HTMLParser):
                 self.meta_description = a.get("content", "").strip()
             elif name == "robots":
                 self.meta_robots = a.get("content", "").strip().lower()
+        elif tag == "link":
+            # `rel` is a space-separated list by spec, so a plain == misses
+            # rel="canonical alternate", which is rarer but valid.
+            if "canonical" in a.get("rel", "").lower().split() and not self.canonical:
+                self.canonical = a.get("href", "").strip()
         elif tag == "script":
             if a.get("type", "").lower() == "application/ld+json":
                 self._capture, self._buf = "jsonld", []
@@ -2733,6 +2745,11 @@ async def fetch_page_facts(client, url: str) -> tuple[_PageFacts | None, str]:
         facts.feed(r.text)
     except Exception:
         return None, "page markup could not be parsed"
+    # After redirects, because a canonical has to be judged against the URL that
+    # actually answered: a site that sends / to /ru/ would otherwise look like
+    # it was pointing every page somewhere else.
+    facts.final_url = str(r.url)
+    facts.x_robots_tag = (r.headers.get("x-robots-tag") or "").strip().lower()
     return facts, ""
 
 
@@ -2852,18 +2869,49 @@ def check_question_content(facts: _PageFacts, rivals: list[dict],
     }
 
 
-def check_ai_crawlers(parsed: dict, path: str, rivals: list[dict]) -> dict | None:
+def check_ai_crawlers(parsed: dict, path: str, rivals: list[dict],
+                      model_results: dict | None = None) -> dict | None:
     blocked, unnamed = [], []
+    blocked_operators: list[str] = []
     for operator, agents in AI_CRAWLERS.items():
         for agent in agents:
             allowed, how = robots_allows(parsed, agent, path)
             if not allowed:
                 blocked.append(f"{agent} ({operator})")
+                if operator not in blocked_operators:
+                    blocked_operators.append(operator)
             elif how == "falls back to *":
                 unnamed.append(agent)
     if not blocked and not unnamed:
         return None
     rivals_naming = [r["name"] for r in rivals if r.get("names_ai_crawlers")]
+
+    # ── the measured consequence, where there is one ──
+    #
+    # This is the pairing nobody can make from one side alone: a blocked
+    # crawler is a fact about the markup, and a model naming you less often is
+    # a fact about the answers. Put together on one line they stop being
+    # advice. A tool that only reads pages cannot say it; nor can one that only
+    # asks models.
+    #
+    # Stated as what was measured, not as a cause. The block is a sufficient
+    # reason for the gap, but it is not the only possible one, and a sentence
+    # that claims more than the data does is worth less than the data.
+    scores = _model_scores(model_results or {})
+    blocked_models = [m for op in blocked_operators
+                      for m in CRAWLER_OPERATOR_MODELS.get(op, []) if m in scores]
+    allowed_models = [m for m in scores if m not in blocked_models]
+    evidence = ""
+    if blocked_models and allowed_models:
+        worst = min(blocked_models, key=lambda k: scores[k][0] / scores[k][1])
+        best = max(allowed_models, key=lambda k: scores[k][0] / scores[k][1])
+        # Only when the one you block does worse than one you allow. Equal
+        # figures are not evidence of anything, and printing them would be
+        # dressing a coincidence as a finding.
+        if scores[worst][0] / scores[worst][1] < scores[best][0] / scores[best][1]:
+            evidence = (f"In this audit {_phrase(worst, scores)} answers, while "
+                        f"{_phrase(best, scores)} — and you allow {MODEL_LABELS.get(best, best)}'s "
+                        f"crawler. ")
     lines = ["# Assistants that answer questions about your category",
              *[f"User-agent: {a}" for a in AI_CRAWLER_FLAT],
              f"Allow: {path}", ""]
@@ -2874,11 +2922,19 @@ def check_ai_crawlers(parsed: dict, path: str, rivals: list[dict]) -> dict | Non
         "severity": "high" if blocked else "low",
         "facts": {"blocked": blocked, "unnamed": len(unnamed),
                   "total_agents": len(AI_CRAWLER_FLAT),
-                  "has_sitemap": bool(parsed.get("sitemaps"))},
+                  "has_sitemap": bool(parsed.get("sitemaps")),
+                  # The pairing, as data rather than as a sentence, so the
+                  # Russian side builds its own line instead of translating
+                  # one. Empty when the models did not actually differ.
+                  "evidence": ({"blocked_model": worst, "blocked_named": scores[worst][0],
+                                "blocked_answers": scores[worst][1],
+                                "allowed_model": best, "allowed_named": scores[best][0],
+                                "allowed_answers": scores[best][1]} if evidence else {})},
         "title": ("AI crawlers are blocked from this page" if blocked
                   else ("No robots.txt rules name the AI crawlers" if len(unnamed) == len(AI_CRAWLER_FLAT)
                         else "Some AI crawlers have no rules of their own")),
         "found": (f"Blocked: {', '.join(blocked)}. " if blocked else "")
+                 + evidence
                  + (f"{len(unnamed)} AI crawler(s) have no rules of their own and fall back "
                     f"to the wildcard group. " if unnamed else "")
                  + ("No sitemap is declared." if not parsed.get("sitemaps") else ""),
@@ -2895,16 +2951,159 @@ def check_ai_crawlers(parsed: dict, path: str, rivals: list[dict]) -> dict | Non
     }
 
 
-def check_js_rendered(facts: _PageFacts) -> dict | None:
+def _same_page(a: str, b: str) -> bool:
+    """Whether two URLs name the same page for indexing purposes.
+
+    Scheme and `www.` are not a difference a canonical is trying to express,
+    and neither is a trailing slash. The query is kept: ?id=4 is a different
+    page, and dropping it would hide a canonical that collapses a catalogue
+    onto one item.
+    """
+    def norm(u: str) -> str:
+        p = urlparse(u)
+        host = p.netloc.lower().removeprefix("www.")
+        path = (p.path or "/").rstrip("/") or "/"
+        return f"{host}{path}?{p.query}" if p.query else f"{host}{path}"
+    return norm(a) == norm(b)
+
+
+def check_indexable(facts: _PageFacts, url: str) -> dict | None:
+    """Whether the page tells crawlers to ignore it, or to count another page.
+
+    Separate from robots.txt on purpose. robots.txt controls fetching; these
+    two control what a fetched page is worth, and they fail quietly — the page
+    loads perfectly in a browser and still asks not to be counted.
+    """
+    directives = f"{facts.meta_robots} {facts.x_robots_tag}"
+    noindex = "noindex" in directives
+    none_directive = re.search(r"(^|[\s,])none([\s,]|$)", directives) is not None
+
+    base = facts.final_url or url
+    canonical_raw = facts.canonical.strip()
+    # Relative hrefs are legal and common. Resolved against the URL that
+    # answered, so ../ lands where the browser would put it.
+    canonical_abs = urljoin(base, canonical_raw) if canonical_raw else ""
+    elsewhere = bool(canonical_abs) and not _same_page(canonical_abs, base)
+
+    if not (noindex or none_directive or elsewhere):
+        return None
+
+    blocking = noindex or none_directive
+
+    # Computed once and reused in both the sentence and the facts. They were
+    # two separate tests before, and the facts one only looked for "noindex" —
+    # so a page saying `content="none"` produced a finding whose facts claimed
+    # it came from nowhere, and the Russian side, which builds its sentence
+    # from the facts, printed an empty list of places.
+    def _says_no(value: str) -> bool:
+        return "noindex" in value or re.search(r"(^|[\s,])none([\s,]|$)", value) is not None
+
+    in_meta = _says_no(facts.meta_robots)
+    in_header = _says_no(facts.x_robots_tag)
+
+    found = []
+    if blocking:
+        where = (['<meta name="robots">'] if in_meta else []
+                 ) + (["the X-Robots-Tag header"] if in_header else [])
+        found.append(f"This page asks not to be indexed, in {' and '.join(where)}.")
+    if elsewhere:
+        found.append(f"Its canonical points at {canonical_abs}, not at itself.")
+
+    changes = []
+    if blocking:
+        changes.append({"field": "robots directive", "where": '<meta name="robots"> / X-Robots-Tag',
+                        "current": (facts.meta_robots or facts.x_robots_tag),
+                        "proposed": "Remove noindex from this page, or drop the tag entirely."})
+    if elsewhere:
+        changes.append({"field": "canonical", "where": '<link rel="canonical">',
+                        "current": canonical_raw,
+                        "proposed": f'<link rel="canonical" href="{base}">'})
+
+    return {
+        "id": "indexable",
+        # A noindex is the loudest thing a page can say. A canonical elsewhere
+        # is often deliberate — a duplicate, a print view — so it is flagged
+        # without being called an error.
+        "severity": "high" if blocking else "medium",
+        "facts": {"noindex": blocking, "canonical": canonical_abs if elsewhere else "",
+                  "in_meta": in_meta, "in_header": in_header, "page": base},
+        "title": ("This page asks not to be indexed" if blocking
+                  else "This page says another page is the real one"),
+        "found": " ".join(found),
+        "why": ("Assistants retrieve from indexes built on exactly these signals, so a page "
+                "carrying either one competes as a copy or not at all — and both fail "
+                "silently: the page looks perfect in a browser." if blocking else
+                "A canonical hands the credit to the page it names. If that is intentional, "
+                "the page it names is the one to check and to improve; if it is left over "
+                "from a template, this page is working for another URL."),
+        "affects_prompts": [],
+        "competitors_doing_it": [],
+        "changes": changes,
+    }
+
+
+# Which model in this product each crawler operator feeds. Anthropic and Common
+# Crawl are deliberately absent: we do not ask Claude, and Common Crawl feeds
+# many models indirectly, so for those two a block has no figure to point at
+# and saying nothing beats implying one.
+CRAWLER_OPERATOR_MODELS = {
+    "OpenAI": ["chatgpt"],
+    "Google": ["gemini", "ai_overview"],
+    "Perplexity": ["perplexity"],
+}
+
+MODEL_LABELS = {
+    "chatgpt": "ChatGPT", "gemini": "Gemini", "perplexity": "Perplexity",
+    "deepseek": "DeepSeek", "ai_overview": "Google AI Overview",
+}
+
+
+def _model_scores(model_results: dict) -> dict[str, tuple[int, int]]:
+    """{model: (named, answers)} for the models that actually answered.
+
+    A model with no answers is dropped rather than carried as a zero: nothing
+    below should be allowed to say "names you in 0 of 0".
+    """
+    out = {}
+    for key, v in (model_results or {}).items():
+        if not isinstance(v, dict):
+            continue
+        answers = int(v.get("answers") or 0)
+        if answers > 0:
+            out[key] = (int(v.get("named") or 0), answers)
+    return out
+
+
+def _phrase(key: str, scores: dict) -> str:
+    named, answers = scores[key]
+    return f"{MODEL_LABELS.get(key, key)} names you in {named} of {answers}"
+
+
+def check_js_rendered(facts: _PageFacts, model_results: dict | None = None) -> dict | None:
     body = facts.body_text()
     if len(body) >= 400:
         return None
+
+    scores = _model_scores(model_results or {})
+    spread = ""
+    if len(scores) >= 2:
+        ranked = sorted(scores, key=lambda k: scores[k][0] / scores[k][1])
+        worst, best = ranked[0], ranked[-1]
+        # Only when the models actually disagree. Two models that both name you
+        # three times out of eight say nothing about rendering, and printing it
+        # anyway would dress a non-finding as evidence.
+        if scores[worst][0] / scores[worst][1] < scores[best][0] / scores[best][1]:
+            spread = (f" Across this audit, {_phrase(worst, scores)} answers and "
+                      f"{_phrase(best, scores)} — which is the shape this produces, "
+                      f"since the models differ in whether they render a page before reading it.")
+
     return {
         "id": "js_rendered",
         "severity": "high",
-        "facts": {"body_chars": len(body)},
+        "facts": {"body_chars": len(body),
+                  "models": {k: {"named": v[0], "answers": v[1]} for k, v in scores.items()}},
         "title": "The page has almost no text until JavaScript runs",
-        "found": f"Only {len(body)} characters of text are present in the HTML itself.",
+        "found": f"Only {len(body)} characters of text are present in the HTML itself." + spread,
         "why": ("Most crawlers that feed assistants do not run JavaScript, so they see an "
                 "empty page. Nothing else on this list can help while this is true."),
         "affects_prompts": [],
@@ -3060,6 +3259,10 @@ class PageCheckRequest(BaseModel):
     # turns generic advice into "add these four questions": the FAQ we propose
     # is built from questions the brand actually lost, not invented ones.
     missed_prompts: list[dict] = []
+    # {model: {named, answers}} from the audit this check was opened from.
+    # Optional: a page check can be run without an audit behind it, and every
+    # check still works — the per-model lines are simply left unsaid.
+    model_results: dict = {}
 
 
 def _origin_and_path(url: str) -> tuple[str, str]:
@@ -3123,11 +3326,18 @@ async def page_check(request: PageCheckRequest):
         robots, robots_reason = await fetch_robots(client, origin)
 
         # A page with no server-rendered text makes checks 1 and 2 measure
-        # nothing, so it is reported alone rather than alongside them.
-        gate = check_js_rendered(facts)
+        # nothing, so they are not reported alongside it.
+        #
+        # The indexing check is the exception and runs anyway: a meta robots
+        # tag and a canonical sit in <head>, which an empty-bodied SPA still
+        # serves. Holding back a noindex until the rendering is fixed would be
+        # hiding the shorter problem behind the longer one.
+        gate = check_js_rendered(facts, request.model_results)
         if gate:
+            indexable = check_indexable(facts, url)
             return {"url": url, "brand": request.brand, "terms": terms,
-                    "blocked_by": gate["id"], "findings": [gate],
+                    "blocked_by": gate["id"],
+                    "findings": [gate] + ([indexable] if indexable else []),
                     "competitors": [], "robots_note": robots_reason}
 
         rivals = []
@@ -3142,7 +3352,8 @@ async def page_check(request: PageCheckRequest):
     findings = [f for f in (
         check_self_declaration(place, readable, request.brand, terms, missed),
         check_question_content(facts, readable, missed),
-        check_ai_crawlers(robots, path, readable),
+        check_ai_crawlers(robots, path, readable, request.model_results),
+        check_indexable(facts, url),
     ) if f]
     order = {"high": 0, "medium": 1, "low": 2}
     findings.sort(key=lambda f: order.get(f["severity"], 3))
@@ -3153,6 +3364,10 @@ async def page_check(request: PageCheckRequest):
         "terms": terms,
         "page": {"title": facts.title, "h1": facts.h1(),
                  "meta_description": facts.meta_description,
+                 "canonical": facts.canonical,
+                 "meta_robots": facts.meta_robots,
+                 "x_robots_tag": facts.x_robots_tag,
+                 "final_url": facts.final_url,
                  "questions": facts.questions(),
                  "schema_types": facts.schema_types(),
                  "body_chars": len(facts.body_text())},
