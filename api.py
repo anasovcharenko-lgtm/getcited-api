@@ -2337,7 +2337,22 @@ async def debug_prompt(q: str = "best AI visibility tracking tools", country: st
 # Source gap: do the pages the models cite actually mention you?
 # ─────────────────────────────────────────────────────────────
 
-SOURCE_CHECK_CONCURRENCY = 6
+# Six meant a ten-page check ran as two waves, and the second wave could not
+# start until the slowest page of the first had finished or timed out. A
+# measured run took five seconds for ten pages with nothing slow in it; one
+# stalled page would have made it seventeen, and two in different waves
+# twenty-four.
+#
+# Twelve puts a normal check in a single wave, so the wall time is the slowest
+# page rather than the sum of two batches. These requests go to a dozen
+# different hosts, not repeatedly at one vendor, so this is not the fan-out that
+# got the DataForSEO account suspended — that was many requests at one API.
+#
+# The endpoint caps the list at 25 URLs, so the worst case stays two waves.
+SOURCE_CHECK_CONCURRENCY = int(os.getenv("SOURCE_CHECK_CONCURRENCY", "12"))
+# Left alone deliberately. Lowering it would turn slow-but-working pages into
+# "unreadable", which is a worse answer than a slow one — and with a single wave
+# this is now the ceiling for the whole check rather than for each batch.
 SOURCE_CHECK_TIMEOUT = 12
 SOURCE_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
