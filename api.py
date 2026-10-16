@@ -2150,6 +2150,11 @@ Data: """ + summary)
         "visibility_score": visibility_score,
         "answers": answers_count,
         "model_scores": totals["model_scores"],
+        # Demand against visibility per cluster. It was computed and then left
+        # behind here for a day: aggregate_audit produced it, this dict names
+        # its fields one by one, and a field nobody names is a field nobody
+        # sends. The guard below exists so the next one cannot do that quietly.
+        "clusters": totals["clusters"],
         "gemini_score": gemini_mentions,
         "chatgpt_score": openai_mentions,
         "total_prompts": len(prompts),
@@ -2171,6 +2176,17 @@ Data: """ + summary)
             "model_errors": dict(MODEL_ERRORS),
         },
     }
+
+    # Everything aggregate_audit computed has to leave the building. This dict
+    # lists its fields by hand, so adding one to the aggregate and forgetting it
+    # here produces a feature that is computed, stored, tested green and never
+    # seen — which is exactly what happened to `clusters`.
+    #
+    # A log rather than an exception: a missing field should not take the audit
+    # down, and Railway's log is where the last two of these were caught.
+    dropped = [k for k in totals if k not in payload]
+    if dropped:
+        print(f"WARNING: audit response is dropping aggregate fields: {dropped}")
 
     got_answers = any(r[m].get("answer") for r in results for m in running)
     if "chatgpt" not in MODEL_ERRORS and got_answers:
