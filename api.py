@@ -11,6 +11,7 @@ import re
 import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qs
 import httpx
@@ -3106,7 +3107,27 @@ async def page_check(request: PageCheckRequest):
     }
 
 
-async def _fetch_page_text(client, url: str) -> tuple[str, str]:
+PAGE_TITLE_LIMIT = 90
+
+
+def _page_title(raw: str) -> str:
+    """The <title> of a fetched page, for showing instead of its URL.
+
+    A McKinsey address is 120 characters of slug and tracking parameters, which
+    tells a reader nothing about what is on the page. The title does.
+
+    Entities are unescaped because titles are full of &amp; and &#8212;, and
+    whitespace is collapsed because plenty of them are indented across three
+    lines in the source.
+    """
+    m = re.search(r"<title[^>]*>(.*?)</title>", raw, re.I | re.S)
+    if not m:
+        return ""
+    t = re.sub(r"\s+", " ", unescape(m.group(1))).strip()
+    return t[:PAGE_TITLE_LIMIT].rstrip() + "…" if len(t) > PAGE_TITLE_LIMIT else t
+
+
+async def _fetch_page_text(client, url: str) -> tuple[str, str, str]:
     """Return (text, reason). Exactly one of them is non-empty.
 
     The reason is written for whoever reads the report, not for a log file:
@@ -3116,30 +3137,34 @@ async def _fetch_page_text(client, url: str) -> tuple[str, str]:
         r = await client.get(url, follow_redirects=True, timeout=SOURCE_CHECK_TIMEOUT,
                              headers={"User-Agent": SOURCE_BROWSER_UA})
     except httpx.TimeoutException:
-        return "", f"took longer than {SOURCE_CHECK_TIMEOUT}s to respond"
+        return "", f"took longer than {SOURCE_CHECK_TIMEOUT}s to respond", ""
     except httpx.ConnectError:
-        return "", "could not connect - domain may be dead or blocking us"
+        return "", "could not connect - domain may be dead or blocking us", ""
     except Exception as exc:
-        return "", f"fetch failed ({type(exc).__name__})"
+        return "", f"fetch failed ({type(exc).__name__})", ""
 
     if r.status_code != 200:
-        return "", _reason_for_status(r.status_code)
+        return "", _reason_for_status(r.status_code), ""
 
     ctype = r.headers.get("content-type", "").split(";")[0].strip()
     if ctype and "html" not in ctype:
-        return "", f"not a web page (content type: {ctype})"
+        return "", f"not a web page (content type: {ctype})", ""
+
+    title = _page_title(r.text)
 
     parser = _PageText()
     try:
         parser.feed(r.text)
     except Exception:
-        return "", "page markup could not be parsed"
+        return "", "page markup could not be parsed", ""
 
     text = parser.text()
     if len(text) < 400:
+        # The title still goes back: the page was reachable, and its name is
+        # worth more on screen than its slug even when the body is unreadable.
         return "", (f"only {len(text)} characters of text - the content is most likely "
-                    "rendered by JavaScript, which we cannot read")
-    return text, ""
+                    "rendered by JavaScript, which we cannot read"), title
+    return text, "", title
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 REDDIT_COMMENT_LIMIT = int(os.getenv("REDDIT_COMMENT_LIMIT", "60"))
@@ -3322,16 +3347,22 @@ async def source_gap(request: SourceGapRequest):
     async with httpx.AsyncClient() as client:
         async def one(url: str) -> dict:
             comment_text = ""
+            # Declared up front because only the plain-page branch produces one;
+            # Reddit and YouTube go through their own fetchers.
+            page_title = ""
             async with sem:
                 if _is_reddit(url):
                     text, comment_text, reason = await _fetch_reddit(client, url)
                 elif _is_youtube(url):
                     text, reason = await _fetch_youtube(client, url)
                 else:
-                    text, reason = await _fetch_page_text(client, url)
+                    text, reason, page_title = await _fetch_page_text(client, url)
 
             domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
-            base = {"url": url, "domain": domain}
+            # The title travels with every verdict, including the failures: a
+            # page can be reachable and still unreadable, and its name is worth
+            # more on screen than 120 characters of slug either way.
+            base = {"url": url, "domain": domain, "title": page_title}
 
             if reason:
                 return {**base, "status": "unreadable", "reason": reason,
