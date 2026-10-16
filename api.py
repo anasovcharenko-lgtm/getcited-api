@@ -368,15 +368,46 @@ def unique_domains(urls: list[str]) -> list[str]:
             seen.append(d)
     return seen[:6]
 
+QUOTE_LIMIT = 160
+
+
 def find_mention_sentence(text: str, brand: str) -> str:
-    """Grab one short sentence/clause mentioning the brand, for a 'what AI says' preview."""
+    """One short sentence naming the brand, for the 'what AI says' preview.
+
+    Three things this has to get right, and it got none of them:
+
+    The models answer in markdown, so the sentence arrives carrying `**` and
+    sometimes a heading marker. Those were passed straight through to a card
+    that renders plain text, which put literal asterisks on screen.
+
+    240 characters is a paragraph, not a quote, in a card meant to be glanced
+    at.
+
+    And the cut was blind — `s[:237]` lands wherever it lands, which produced
+    "операционной инфрастр...". Breaking at the last space costs a few
+    characters and reads like a sentence that was trimmed rather than one that
+    was damaged.
+    """
     if not text:
         return ""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    for s in sentences:
-        if brand.lower() in s.lower():
-            s = s.strip()
-            return s if len(s) <= 240 else s[:237] + "..."
+    for s in re.split(r'(?<=[.!?])\s+', text):
+        if brand.lower() not in s.lower():
+            continue
+        s = re.sub(r'^[-*]\s+', '', s.strip())      # a bullet marker opening it
+        s = re.sub(r'#{1,6}\s+', '', s)             # a heading that ran on
+        s = s.replace("**", "").replace("`", "")
+        # Collapsed last, and not only trimmed at the ends: removing a heading
+        # marker leaves the newline that followed it sitting inside the quote,
+        # which renders as a gap in the middle of a line.
+        s = re.sub(r'\s+', ' ', s).strip()
+        if len(s) <= QUOTE_LIMIT:
+            return s
+        cut = s[:QUOTE_LIMIT]
+        # rsplit rather than a fixed index: never mid-word. The guard is for a
+        # sentence with no space in its first 160 characters, where there is
+        # no good break and the hard cut is the honest answer.
+        space = cut.rfind(" ")
+        return (cut[:space] if space > QUOTE_LIMIT // 2 else cut).rstrip(" ,;:—-") + "…"
     return ""
 
 async def fetch_site_text(url: str) -> tuple[str, str]:
