@@ -572,10 +572,75 @@ KEYWORD_MAX_CHARS = 80
 # their risk system suspended the account for it — a self-inflicted outage
 # caused by retrying rather than by the wrong password itself.
 #
-# Any auth-shaped failure now latches, and the rest of the audit skips the call
-# entirely. It clears on restart, which a redeploy after fixing the credentials
-# provides anyway.
+# Any auth-shaped failure latches, and the rest of the audit skips the call
+# entirely.
+#
+# It used to clear only on restart, on the reasoning that a redeploy follows
+# fixing the credentials anyway. That holds for a wrong password and fails for
+# the commoner case: the account runs out of money, somebody tops it up, and
+# nothing works until an unrelated deploy happens to restart the process. So
+# the latch expires on its own — long enough to stop a fan-out hammering a
+# refusing vendor, short enough that paying the bill is the only fix needed.
 _DATAFORSEO_LOCKED = ""
+_DATAFORSEO_LOCKED_AT = 0.0
+DATAFORSEO_LOCK_SECONDS = int(os.getenv("DATAFORSEO_LOCK_SECONDS", "600"))
+
+
+def _lock_dataforseo(reason: str) -> None:
+    global _DATAFORSEO_LOCKED, _DATAFORSEO_LOCKED_AT
+    _DATAFORSEO_LOCKED = reason
+    _DATAFORSEO_LOCKED_AT = time.time()
+
+
+def dataforseo_locked() -> str:
+    """The reason calls are being skipped, or "" once the latch has expired."""
+    global _DATAFORSEO_LOCKED, _DATAFORSEO_LOCKED_AT
+    if not _DATAFORSEO_LOCKED:
+        return ""
+    if time.time() - _DATAFORSEO_LOCKED_AT >= DATAFORSEO_LOCK_SECONDS:
+        print(f"DataForSEO latch expired after {DATAFORSEO_LOCK_SECONDS}s, trying again")
+        _DATAFORSEO_LOCKED, _DATAFORSEO_LOCKED_AT = "", 0.0
+        return ""
+    return _DATAFORSEO_LOCKED
+
+
+def dataforseo_reason(resp) -> str:
+    """Why DataForSEO refused, in the words that actually say why.
+
+    The vendor answers an HTTP error with its ordinary envelope, and that
+    envelope opens with about 150 characters of version string, a 20000 "Ok."
+    for the request itself, timing and cost before it reaches `tasks`. So
+    `resp.text[:200]` returns the part that says nothing and stops a character
+    or two short of the part that does.
+
+    On the 402 that prompted this, the message on screen read `"status_code":
+    20000, "status_message": "Ok."` while the real answer — 40200, Payment
+    Required — sat just past the cut. Reading the task is the whole fix.
+    """
+    body = (resp.text or "").strip()
+    try:
+        data = resp.json()
+    except Exception:
+        return f"{resp.status_code}: {body[:200]}" if body else f"HTTP {resp.status_code}"
+    if not isinstance(data, dict):
+        return f"{resp.status_code}: {body[:200]}"
+
+    tasks = data.get("tasks") or []
+    task = tasks[0] if tasks and isinstance(tasks[0], dict) else {}
+    code = task.get("status_code")
+    message = (task.get("status_message") or "").strip()
+    try:
+        failed = int(code) >= 40000
+    except (TypeError, ValueError):
+        failed = False
+    if failed:
+        return f"{resp.status_code}: {code} {message}".rstrip()
+
+    # No per-task failure to read, so the envelope's own words are the best
+    # there is — still prefixed with the HTTP status, which is the one thing
+    # that is certainly true.
+    top = (data.get("status_message") or "").strip()
+    return f"{resp.status_code}: {top}" if top else f"{resp.status_code}: {body[:200]}"
 
 # The latch alone does not help against a full fan-out: twenty prompts all start
 # before the first one fails, so all twenty requests go out anyway — measured,
@@ -998,8 +1063,7 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
     searches this", and that is a different statement from "Google has no data",
     which is what a null actually means.
     """
-    global _DATAFORSEO_LOCKED
-    if not KEYWORD_VOLUME_ENABLED or _DATAFORSEO_LOCKED:
+    if not KEYWORD_VOLUME_ENABLED or dataforseo_locked():
         return {}
     eligible = [p for p in prompts if keyword_eligible(p)]
     if not eligible:
@@ -1056,7 +1120,7 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
                     # Not a wrong path — a refused account. Trying the other
                     # path doubles the rejected attempts for no chance of
                     # success.
-                    _DATAFORSEO_LOCKED = f"{resp.status_code}: {resp.text[:200]}"
+                    _lock_dataforseo(dataforseo_reason(resp))
                     return {}
                 continue
             data = resp.json()
@@ -1066,8 +1130,8 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
                       f"{task.get('status_code')} "
                       f"{task.get('status_message', '')[:200]}")
                 if task.get("status_code") in DATAFORSEO_FATAL:
-                    _DATAFORSEO_LOCKED = (f"{task.get('status_code')}: "
-                                          f"{task.get('status_message', '')[:200]}")
+                    _lock_dataforseo(f"{task.get('status_code')} "
+                                     f"{task.get('status_message', '')[:200]}".strip())
                     return {}
                 continue
 
@@ -1109,7 +1173,6 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
     overview at all here; that is a fact about the query, and the audit should
     show it rather than hide it.
     """
-    global _DATAFORSEO_LOCKED
     if not AI_OVERVIEW_ENABLED:
         MODEL_ERRORS["ai_overview"] = "disabled"
         return ""
@@ -1119,8 +1182,9 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
         async with _dataforseo_gate:
             # Checked inside the gate, not before it: a prompt that waited its
             # turn must see a refusal that arrived while it waited.
-            if _DATAFORSEO_LOCKED:
-                MODEL_ERRORS["ai_overview"] = _DATAFORSEO_LOCKED
+            locked = dataforseo_locked()
+            if locked:
+                MODEL_ERRORS["ai_overview"] = locked
                 return ""
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
@@ -1135,11 +1199,11 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
                            "load_async_ai_overview": True}],
                 )
         if resp.status_code >= 400:
-            detail = f"{resp.status_code}: {resp.text[:200]}"
+            detail = dataforseo_reason(resp)
             print(f"AI Overview error {detail}")
             MODEL_ERRORS["ai_overview"] = detail
             if resp.status_code in (401, 402, 403, 429):
-                _DATAFORSEO_LOCKED = detail
+                _lock_dataforseo(detail)
                 print("AI Overview: credentials refused, not calling again this run")
             return ""
         data = resp.json()
@@ -1158,7 +1222,7 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
             # A per-task failure about the account, not about this query, must
             # stop the remaining prompts too.
             if task.get("status_code") in DATAFORSEO_FATAL:
-                _DATAFORSEO_LOCKED = detail
+                _lock_dataforseo(detail)
                 print("AI Overview: account refused, not calling again this run")
             return ""
 
@@ -3133,14 +3197,13 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
     This endpoint requires a language, unlike the volume one, which must not be
     given one.
     """
-    global _DATAFORSEO_LOCKED
-    if not KEYWORD_VOLUME_ENABLED or _DATAFORSEO_LOCKED or not keywords:
+    if not KEYWORD_VOLUME_ENABLED or dataforseo_locked() or not keywords:
         return {}
     location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
     language = DATAFORSEO_LANGUAGES.get((country or "").upper(), DATAFORSEO_DEFAULT_LANGUAGE)
     try:
         async with _dataforseo_gate:
-            if _DATAFORSEO_LOCKED:
+            if dataforseo_locked():
                 return {}
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
@@ -3153,15 +3216,15 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
         if resp.status_code >= 400:
             print(f"keyword difficulty {resp.status_code}: {resp.text[:200]}")
             if resp.status_code in (401, 402, 403, 429):
-                _DATAFORSEO_LOCKED = f"{resp.status_code}: {resp.text[:200]}"
+                _lock_dataforseo(dataforseo_reason(resp))
             return {}
         task = (resp.json().get("tasks") or [{}])[0]
         if task.get("status_code", 20000) >= 40000:
             print(f"keyword difficulty task failed: {task.get('status_code')} "
                   f"{task.get('status_message', '')[:200]}")
             if task.get("status_code") in DATAFORSEO_FATAL:
-                _DATAFORSEO_LOCKED = (f"{task.get('status_code')}: "
-                                      f"{task.get('status_message', '')[:200]}")
+                _lock_dataforseo(f"{task.get('status_code')} "
+                                 f"{task.get('status_message', '')[:200]}".strip())
             return {}
         out: dict = {}
         for result in (task.get("result") or []):
@@ -3244,7 +3307,7 @@ async def keyword_research(request: KeywordResearchRequest):
     rows.sort(key=lambda r: (r["search_volume"] is None, -(r["search_volume"] or 0)))
     return {"results": rows,
             "country": (request.country or "US").upper(),
-            "error": _DATAFORSEO_LOCKED or ""}
+            "error": dataforseo_locked()}
 
 
 class PageCheckRequest(BaseModel):
