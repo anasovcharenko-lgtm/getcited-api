@@ -791,14 +791,39 @@ PERPLEXITY_SHAPES: list[tuple[str, str]] = [
 _perplexity_shape: int | None = None   # index of the one that answered
 
 
+def _perplexity_model(kind: str) -> str:
+    """The configured model, spelled the way this shape spells it.
+
+    The Agent API namespaces its models — `perplexity/sonar`, never the bare
+    `sonar` — while the retired chat endpoint wants the bare one. Rather than
+    make the env var pick a side and break the other, each shape rewrites the
+    configured name for itself, so PERPLEXITY_MODEL=sonar stays correct wherever
+    it lands.
+    """
+    name = (PERPLEXITY_MODEL or "sonar").strip()
+    if kind == "chat":
+        return name.split("/")[-1]
+    return name if "/" in name else f"perplexity/{name}"
+
+
 def _perplexity_body(kind: str, prompt: str) -> dict:
     if kind == "chat":
-        return {"model": PERPLEXITY_MODEL,
+        return {"model": _perplexity_model(kind),
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": MAX_ANSWER_TOKENS}
     if kind == "preset":
+        # A preset carries its own search behaviour, so no tool is added here.
         return {"preset": PERPLEXITY_PRESET, "input": prompt}
-    return {"model": PERPLEXITY_MODEL, "input": prompt}
+    # Search has to be asked for now. The old code leaned on Perplexity always
+    # searching, which was true of Sonar and is not true of the Agent API: a
+    # request without the tool is answered from the model's memory. That would
+    # not look like a failure — a fluent answer still arrives — it would quietly
+    # measure what the model remembers instead of what it tells someone asking
+    # today. Same swap the DeepSeek note warns about, minus the warning.
+    return {"model": _perplexity_model(kind),
+            "input": prompt,
+            "tools": [{"type": "web_search"}],
+            "max_output_tokens": MAX_ANSWER_TOKENS}
 
 
 def _perplexity_text(data: dict) -> str:
@@ -857,9 +882,11 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
     Without that the answer would reach the screen with no sources at all —
     Perplexity cites with bare [1] markers and rarely inlines a URL.
 
-    `country` is accepted and not sent: the old web_search_options field has no
-    documented equivalent here, and inventing a key risks a 400 on every call.
-    Results will be Perplexity's default market until the live shape is known.
+    `country` is accepted and not sent. The Agent API does take search filters,
+    under tools[web_search].filters, but the migration guide does not spell the
+    key for a market — and the guide is explicit that an unmapped field returns
+    400, which would take Perplexity out of every audit rather than one. It goes
+    in once a real response has shown the name, not before.
     """
     global _perplexity_shape
     if not PERPLEXITY_ENABLED:
@@ -871,7 +898,7 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
         order.remove(_perplexity_shape)
         order.insert(0, _perplexity_shape)
 
-    last = ""
+    tried: list[str] = []
     for i in order:
         path, kind = PERPLEXITY_SHAPES[i]
         try:
@@ -883,8 +910,9 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
                     json=_perplexity_body(kind, prompt),
                 )
             if resp.status_code >= 400:
-                last = f"{resp.status_code} on {path}: {resp.text[:200]}"
-                print(f"Perplexity {last}")
+                note = f"{resp.status_code} on {path}: {resp.text[:200]}"
+                tried.append(note)
+                print(f"Perplexity {note}")
                 # 401 is the key, not the shape, and no other path will fix it —
                 # stop rather than turn one clear failure into three. 403 is not
                 # treated that way: the migration notice arrives as a 403.
@@ -893,10 +921,23 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
                 continue
 
             data = resp.json()
+
+            # A failed run arrives inside a 200: `status` says so and the body
+            # carries the error. Judging by the HTTP code alone files that under
+            # "answered with no text", which names the symptom and loses the
+            # cause — the thing we are here to stop doing.
+            state = data.get("status")
+            if state in ("failed", "cancelled"):
+                note = f"{path} returned status={state}: {str(data.get('error'))[:200]}"
+                tried.append(note)
+                print(f"Perplexity {note}")
+                continue
+
             text = _perplexity_text(data)
             if not text:
-                last = f"{path} answered with no text: {str(data)[:200]}"
-                print(f"Perplexity {last}")
+                note = f"{path} answered with no text: {str(data)[:200]}"
+                tried.append(note)
+                print(f"Perplexity {note}")
                 continue
 
             urls = _perplexity_urls(data)
@@ -909,11 +950,16 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
             MODEL_ERRORS.pop("perplexity", None)
             return text
         except Exception as e:
-            last = f"{path}: {str(e)[:200]}"
-            print(f"Perplexity error on {last}")
+            note = f"{path}: {str(e)[:200]}"
+            tried.append(note)
+            print(f"Perplexity error on {note}")
             continue
 
-    MODEL_ERRORS["perplexity"] = last or "no response"
+    # Every shape's failure, not only the last one attempted. The old line
+    # overwrote on each pass, so the migration notice from the retired endpoint
+    # buried whatever the current endpoint had actually said — the reason was
+    # collected and then discarded one line before it was needed.
+    MODEL_ERRORS["perplexity"] = " | ".join(tried) if tried else "no response"
     return ""
 
 
