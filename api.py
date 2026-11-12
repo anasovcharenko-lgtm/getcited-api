@@ -2856,10 +2856,38 @@ async def add_models_to_audit(request: AddModelsRequest):
     print(f"  added models {added} over {len(previous)} prompts"
           + (f", already complete: {skipped}" if skipped else ""))
 
+    # Rebuilt here, and the reason is worth keeping.
+    #
+    # The first version returned the recalculated figures and left this out.
+    # The caller merges the response over the audit it holds, so a field that
+    # is absent is a field that keeps its old value: the score moved, the
+    # denominator moved, and the banner above them went on saying the model had
+    # not responded — about answers that were by then on the page.
+    #
+    # Anything derived from the answers has to come back with them.
+    answered_by = totals["answers_by_model"]
+    model_status = {
+        m: {"ok": answered_by.get(m, 0) > 0,
+            "enabled": MODEL_SWITCHES[m](),
+            "selected": m in running,
+            "answered": answered_by.get(m, 0),
+            "asked": len(previous) if m in running else 0,
+            # Only for models actually asked just now. MODEL_ERRORS is global
+            # and the sub-audit cleared it, so it knows nothing about why a
+            # model we did not touch was quiet last time — and inventing a
+            # reason is worse than leaving the field empty next to a count
+            # that already says what happened.
+            "error": (MODEL_ERRORS.get(m) if m in added
+                      else (None if m in running else "not selected for this audit"))}
+        for m in ALL_MODELS
+    }
+
     return {**totals,
             "results": previous,
             "citations": citations,
             "models_run": running,
+            "model_status": model_status,
+            "models_answered": [m for m in running if answered_by.get(m, 0)],
             "models_used": {m: MODEL_VERSIONS[m]() for m in ALL_MODELS},
             "added_models": added,
             "already_complete": skipped,
