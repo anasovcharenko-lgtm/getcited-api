@@ -2725,6 +2725,138 @@ async def extend_audit(request: ExtendRequest):
             "extended_at": datetime.now(timezone.utc).isoformat()}
 
 
+class AddModelsRequest(AuditRequest):
+    """A finished audit, plus the models to fill in on the prompts it already has.
+
+    The mirror of /audit/extend. That one holds the models still and adds
+    prompts; this one holds the prompts still and adds models. Both exist
+    because a run can come up short in either direction, and re-running from
+    scratch to recover one of them pays again for everything that worked.
+    """
+    previous_results: list[dict] = []
+    previous_citations: list[dict] = []
+    add_models: list[str] = []
+
+
+@app.post("/audit/add-models", dependencies=[Depends(caller)])
+async def add_models_to_audit(request: AddModelsRequest):
+    previous = request.previous_results or []
+    if not previous:
+        return {"error": "nothing to add to",
+                "detail": "Send the results you already have, or run a normal audit."}
+
+    wanted = [m for m in request.add_models if m in ALL_MODELS]
+    if not wanted:
+        return {"error": "no known model to add",
+                "detail": f"known models: {', '.join(ALL_MODELS)}"}
+
+    off = [m for m in wanted if not MODEL_SWITCHES[m]()]
+    if off:
+        # Switched off is a billing decision taken on the server. Saying so
+        # beats running and returning an audit with a silent column in it.
+        return {"error": "those models are switched off", "detail": ", ".join(off)}
+
+    # Which models this audit already ran, read from the rows themselves rather
+    # than taken on the caller's word. A row carrying a model's key is a row
+    # that model was asked for, answer or no answer — which is exactly the
+    # question, and the rows cannot be out of date about their own contents.
+    ran_before = {m for r in previous for m in ALL_MODELS if m in r}
+
+    added, skipped = [], []
+    citations_new: list[dict] = []
+    for m in wanted:
+        # Only the prompts this model has no answer for.
+        #
+        # This is the whole economy of the endpoint. A model that answered nine
+        # of ten is topped up by one; a model that answered none is measured on
+        # all of them; and a model already complete costs nothing and is told
+        # so. Re-running the model wholesale would be simpler and would buy
+        # nine answers that are already paid for and already on screen.
+        gaps = [(r.get("prompt") or "").strip() for r in previous
+                if (r.get("prompt") or "").strip()
+                and not ((r.get(m) or {}).get("answer") or "").strip()]
+        if not gaps:
+            skipped.append(m)
+            continue
+
+        sub = AuditRequest(**{**request.model_dump(
+            exclude={"previous_results", "previous_citations", "add_models",
+                     "extra_prompts", "custom_prompts", "models"}),
+            "custom_prompts": gaps, "extra_prompts": [], "models": [m],
+            "skip_recommendations": True})
+        measured = await run_audit(sub)
+        if not isinstance(measured, dict) or "results" not in measured:
+            return {"error": f"could not measure {m}", "detail": str(measured)[:300]}
+
+        # Graft the model's own block into the rows already held, matched on the
+        # prompt. Only that block: everything else on the row — prompt_type,
+        # search volume — was settled by the original run and must not be
+        # recomputed from a sub-audit that knows less about the brand.
+        fresh = {(r.get("prompt") or "").strip().lower(): r.get(m)
+                 for r in measured["results"]}
+        for row in previous:
+            key = (row.get("prompt") or "").strip().lower()
+            if key in fresh and fresh[key] is not None:
+                row[m] = fresh[key]
+        added.append(m)
+        citations_new.extend(measured.get("citations", []))
+
+    if not added:
+        return {"error": "those models already answered every prompt",
+                "detail": ", ".join(skipped)}
+
+    running = sorted(ran_before | set(added))
+    competitors, competitor_domains = [], {}
+    for c in request.competitor_list:
+        for i, n in enumerate([x.strip() for x in c.name.split(",") if x.strip()]):
+            competitors.append(n)
+            sites = [w.strip() for w in c.website.split(",") if w.strip()]
+            site = sites[i] if i < len(sites) else (sites[0] if len(sites) == 1 else "")
+            if site:
+                competitor_domains[n] = extract_domain(
+                    site if site.startswith("http") else "https://" + site)
+    if not competitors:
+        competitors = [n.strip() for c in request.competitors for n in c.split(",") if n.strip()]
+
+    clean_brand = request.brand
+    brand_domain = extract_domain(request.website) if request.website else ""
+    # The same function the ordinary audit uses, so a topped-up audit and a
+    # fresh one over the same answers cannot report different numbers.
+    totals = aggregate_audit(previous, running, request.brand, clean_brand,
+                             competitors, competitor_domains, brand_domain)
+
+    by_domain = {c["domain"]: dict(c) for c in (request.previous_citations or [])}
+    for c in citations_new:
+        cur = by_domain.get(c["domain"])
+        if cur:
+            for k in [f"{m}_count" for m in ALL_MODELS] + ["total"]:
+                if k in c:
+                    cur[k] = cur.get(k, 0) + c.get(k, 0)
+        else:
+            by_domain[c["domain"]] = dict(c)
+    citations = sorted(by_domain.values(), key=lambda x: x.get("total", 0), reverse=True)[:10]
+
+    print(f"  added models {added} over {len(previous)} prompts"
+          + (f", already complete: {skipped}" if skipped else ""))
+
+    return {**totals,
+            "results": previous,
+            "citations": citations,
+            "models_run": running,
+            "models_used": {m: MODEL_VERSIONS[m]() for m in ALL_MODELS},
+            "added_models": added,
+            "already_complete": skipped,
+            # The added answers were collected now, not when the rest were.
+            # Models revise what they say, so a score mixing the two is mixing
+            # two moments, and whoever reads it later should be able to see
+            # that rather than infer it from the run date.
+            "models_measured_at": {m: datetime.now(timezone.utc).isoformat()
+                                   for m in added},
+            # The caller keeps its own: these were not regenerated.
+            "recommendations": "",
+            "extended_at": datetime.now(timezone.utc).isoformat()}
+
+
 @app.post("/clear-cache", dependencies=[Depends(caller)])
 async def clear_cache():
     n = len(AUDIT_CACHE) + len(PROMPT_CACHE)
