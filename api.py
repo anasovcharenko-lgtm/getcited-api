@@ -2255,6 +2255,9 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         # disagreeing whenever a model was asked and did not answer.
         "answers": total_checks,
         "models_answered": answered_models,
+        # Per model, so whether one spoke is a count of what came back rather
+        # than an inference from whichever prompt happened to fail last.
+        "answers_by_model": answers_by_model,
         "total_prompts": len(results),
         "mentions_score": mentions_with_link_count,
         "citations_score": mentions_without_link_count,
@@ -2530,6 +2533,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
 
     totals = aggregate_audit(results, running, brand, clean_brand, competitors,
                              competitor_domains, brand_domain)
+    answered_by = totals["answers_by_model"]
     gemini_mentions = totals["gemini_score"]
     openai_mentions = totals["chatgpt_score"]
     visibility_score = totals["visibility_score"]
@@ -2584,10 +2588,23 @@ Data: """ + summary)
         # Built from the registry, so a model added later reports its status
         # without this block being touched. "did not run" and "ran and found
         # nothing" are different facts and must not look alike.
+        #
+        # `ok` counts answers instead of reading MODEL_ERRORS. That dict holds
+        # one string per model and every prompt overwrites it, so the verdict
+        # came from whichever prompt happened to go last: a model that answered
+        # nine and failed the tenth was reported silent, and one that failed
+        # nine and scraped through on the last was reported fine. The score
+        # underneath was always right — it divides by answers received — so the
+        # figure and the sentence above it could disagree.
+        #
+        # `answered` and `asked` are published so a partial run can say how
+        # partial instead of rounding to all or nothing.
         "model_status": {
-            m: {"ok": m in running and m not in MODEL_ERRORS,
+            m: {"ok": answered_by.get(m, 0) > 0,
                 "enabled": MODEL_SWITCHES[m](),
                 "selected": m in running,
+                "answered": answered_by.get(m, 0),
+                "asked": len(results) if m in running else 0,
                 "error": (MODEL_ERRORS.get(m) if m in running
                           else "not selected for this audit")}
             for m in ALL_MODELS
