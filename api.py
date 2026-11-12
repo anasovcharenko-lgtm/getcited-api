@@ -765,7 +765,19 @@ _dataforseo_gate = asyncio.Semaphore(DATAFORSEO_CONCURRENCY)
 
 # Auth and account-state failures, as opposed to "this query had no overview".
 # 40100 unauthorized, 40200 payment required, 40201 account suspended.
-DATAFORSEO_FATAL = {40100, 40101, 40200, 40201, 40202}
+#
+# 40101 is deliberately NOT here, and the comment above is why it ever was: it
+# sits between two codes that are about the account, so it was swept in with
+# them by its number rather than its meaning. It means the search engine
+# errored on one query, after DataForSEO had already retried internally —
+# nothing to do with the account, and they refund it.
+#
+# Treating it as fatal cost far more than the query it belonged to. One flaky
+# fetch tripped the latch, and the latch is account-wide: every remaining
+# prompt in the audit got nothing, and so did the next ten minutes. AI
+# Overviews would pass a single test and then vanish from a real run, which is
+# exactly how it presented.
+DATAFORSEO_FATAL = {40100, 40200, 40201, 40202}
 
 KEYWORD_VOLUME_PATHS = [
     "/v3/keywords_data/google_ads/search_volume/live",
