@@ -4,7 +4,9 @@ from pydantic import BaseModel
 from dataclasses import dataclass
 from collections import defaultdict
 from google import genai
+from google.genai import types as genai_types
 from openai import AsyncOpenAI
+import json
 import os
 import time
 import re
@@ -26,8 +28,71 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Both clients are built on first use, not here.
+#
+# These were two plain constructor calls at import, and both raise when the key
+# is missing or empty. So one absent variable stopped the module importing and
+# took the entire service down — every endpoint, not merely the model whose key
+# it was. During a credential rotation that is exactly the wrong failure: the
+# minute a variable is briefly wrong is the minute the site goes dark, and the
+# only trace is a stack trace in the deploy log.
+#
+# Built lazily, a missing credential costs one model, the audit says which, and
+# everything else keeps serving.
+_gemini: "genai.Client | None" = None
+_openai: "AsyncOpenAI | None" = None
+
+
+def _vertex_credentials():
+    """Service-account credentials out of the JSON held in an env var.
+
+    Google's libraries want a file path in GOOGLE_APPLICATION_CREDENTIALS, and a
+    platform configured entirely through environment variables has nowhere to
+    keep a file that survives a deploy. So the JSON travels as a string and is
+    parsed here.
+
+    None is a real answer, not a failure: on a host with workload identity or a
+    genuine credentials file the library finds its own, and this should not
+    stand in the way.
+    """
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        return None
+    from google.oauth2 import service_account
+    return service_account.Credentials.from_service_account_info(
+        json.loads(raw),
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+
+
+def gemini_client() -> "genai.Client":
+    """Gemini, through Vertex AI when configured and the Gemini API otherwise.
+
+    Two backends because they bill from different tills. The Gemini API draws on
+    a prepaid balance held in AI Studio; Vertex charges the ordinary Cloud
+    billing account. Where AI Studio's balance cannot be topped up — that page
+    is not offered in every country — Vertex is how the same models get paid for
+    with a card that works.
+
+    Which one is live is one variable, so going back is one variable too.
+    """
+    global _gemini
+    if _gemini is None:
+        if GEMINI_VERTEX:
+            _gemini = genai.Client(vertexai=True,
+                                   project=GOOGLE_CLOUD_PROJECT,
+                                   location=GOOGLE_CLOUD_LOCATION,
+                                   credentials=_vertex_credentials())
+        else:
+            _gemini = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    return _gemini
+
+
+def openai_client() -> AsyncOpenAI:
+    global _openai
+    if _openai is None:
+        _openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _openai
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -487,7 +552,22 @@ OPENAI_UTILITY_MODEL = os.getenv("OPENAI_UTILITY_MODEL", "gpt-5.6-luna")
 OPENAI_UTILITY_FALLBACKS = ["gpt-5-nano", "gpt-4.1-mini"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
-GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
+# Vertex AI as the other way to reach the same models. Off unless asked for, so
+# a deploy that says nothing keeps the Gemini API path it already had.
+GEMINI_VERTEX = os.getenv("GEMINI_VERTEX", "false").lower() == "true"
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+# "global" rather than a named region: Gemini is served there, and it spares us
+# guessing which region carries which model this month.
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+
+# The switch now checks that the backend it would use is actually configured,
+# the way Perplexity's and DeepSeek's do. It did not, and the difference showed:
+# with a dead key Gemini stayed "on" and failed once per prompt, so the status
+# read "error" when the honest word was "off". A switch that cannot see its own
+# credential is a switch that lies about what the audit measured.
+GEMINI_ENABLED = (os.getenv("GEMINI_ENABLED", "false").lower() == "true"
+                  and bool(GOOGLE_CLOUD_PROJECT if GEMINI_VERTEX
+                           else os.getenv("GEMINI_API_KEY", "")))
 
 # Perplexity. `sonar` is the cheap grounded model: a request fee plus tokens,
 # roughly $0.007 an answer, so a 50-prompt audit costs about 35 cents. It always
@@ -527,6 +607,12 @@ DATAFORSEO_LOCATIONS = {
     "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "PL": "Poland",
     "AE": "United Arab Emirates", "KZ": "Kazakhstan", "CA": "Canada",
     "AU": "Australia", "IN": "India", "BR": "Brazil",
+    # Spanish-speaking Americas. Absent until now, and absence here was not
+    # neutral: an unlisted country fell through to the default, so an audit of
+    # Chile asked DataForSEO for United States overviews and the report called
+    # them Chile. Plausible numbers for the wrong market are worse than none.
+    "CL": "Chile", "MX": "Mexico", "AR": "Argentina",
+    "CO": "Colombia", "PE": "Peru",
 }
 DATAFORSEO_DEFAULT_LOCATION = os.getenv("DATAFORSEO_LOCATION", "United States")
 
@@ -541,8 +627,35 @@ DATAFORSEO_LANGUAGES = {
     "US": "en", "GB": "en", "UK": "en", "CA": "en", "AU": "en", "IN": "en",
     "RU": "ru", "KZ": "ru", "TR": "tr", "DE": "de", "FR": "fr", "ES": "es",
     "IT": "it", "NL": "nl", "PL": "pl", "BR": "pt", "AE": "en",
+    "CL": "es", "MX": "es", "AR": "es", "CO": "es", "PE": "es",
 }
 DATAFORSEO_DEFAULT_LANGUAGE = os.getenv("DATAFORSEO_LANGUAGE", "en")
+
+_MARKETS_WARNED: set[str] = set()
+
+
+def dataforseo_market(country: str) -> tuple[str, str]:
+    """The place and language to ask for — and a complaint when we had to guess.
+
+    Three call sites used to spell this inline as `.get(code, DEFAULT)`, which
+    turned an unlisted country silently into the United States. Silently is the
+    whole problem: the audit then reports US overviews under the name of the
+    market that was requested, and nothing anywhere contradicts it.
+
+    It still falls back, because refusing to run is not better than running in
+    the default market. But it says so, once per unknown code, so the gap shows
+    up in a log rather than in a customer's report.
+    """
+    code = (country or "").strip().upper()
+    location = DATAFORSEO_LOCATIONS.get(code)
+    if location is None:
+        if code and code not in _MARKETS_WARNED:
+            _MARKETS_WARNED.add(code)
+            print(f"WARNING: no DataForSEO market for country {code!r}; using "
+                  f"{DATAFORSEO_DEFAULT_LOCATION}. Overviews will describe that "
+                  f"market, not {code!r}.")
+        location = DATAFORSEO_DEFAULT_LOCATION
+    return location, DATAFORSEO_LANGUAGES.get(code, DATAFORSEO_DEFAULT_LANGUAGE)
 
 # How often the phrase is searched on Google. Billed per request rather than per
 # keyword, so the whole prompt set costs one call — about nine cents — and the
@@ -675,6 +788,9 @@ DATAFORSEO_LOCATION_CODES = {
     "US": 2840, "GB": 2826, "UK": 2826, "CA": 2124, "AU": 2036, "IN": 2356,
     "RU": 2643, "KZ": 2398, "TR": 2792, "DE": 2276, "FR": 2250, "ES": 2724,
     "IT": 2380, "NL": 2528, "PL": 2616, "BR": 2076, "AE": 2784,
+    # Google's geo target IDs are 2000 plus the ISO 3166-1 numeric code, which
+    # is how every line above checks out and how these were derived.
+    "CL": 2152, "MX": 2484, "AR": 2032, "CO": 2170, "PE": 2604,
 }
 
 # The registry. Every model the audit knows about is declared here once, in
@@ -697,7 +813,11 @@ ALL_MODELS = list(MODEL_SWITCHES)
 # at import: these are env vars, and a run has to record what actually answered.
 MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     "chatgpt": lambda: OPENAI_SEARCH_MODEL,
-    "gemini": lambda: GEMINI_MODEL,
+    # The backend is part of what answered, not a deployment detail: the same
+    # model name served through Vertex and through the Gemini API is two
+    # different bills and, with the location config, potentially two different
+    # answers. A stored run should say which one it was.
+    "gemini": lambda: f"{GEMINI_MODEL} via vertex" if GEMINI_VERTEX else GEMINI_MODEL,
     "perplexity": lambda: PERPLEXITY_MODEL,
     "deepseek": lambda: DEEPSEEK_MODEL,
     "ai_overview": lambda: "google ai overview via dataforseo",
@@ -745,28 +865,118 @@ def _collect_gemini_urls(response) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-async def ask_gemini(prompt: str) -> str:
+# Where a market is, for the one model that localises by coordinates.
+#
+# Every other model takes a country: OpenAI a user_location, DataForSEO a place
+# name. Gemini takes a point on the globe, in toolConfig.retrievalConfig —
+# which sits beside the search tool rather than inside it, and is why ask_gemini
+# went without a country for as long as it did. The tool's own config is empty,
+# so reading only that gives the firm impression there is nothing to set.
+#
+# These are each country's commercial centre rather than its geographic middle,
+# because a coordinate is being asked to stand in for "what a buyer here is
+# shown", and that is the closest a point gets to it. It is still a weaker
+# claim than the other three make, and the dashboard should not pretend
+# otherwise: they are given a market, this one is given a place in it.
+COUNTRY_LATLNG = {
+    "US": (40.7128, -74.0060),    # New York
+    "GB": (51.5074, -0.1278),     # London
+    "CA": (43.6532, -79.3832),    # Toronto
+    "AU": (-33.8688, 151.2093),   # Sydney
+    "IN": (19.0760, 72.8777),     # Mumbai
+    "RU": (55.7558, 37.6173),     # Moscow
+    "KZ": (43.2220, 76.8512),     # Almaty
+    "TR": (41.0082, 28.9784),     # Istanbul
+    "DE": (52.5200, 13.4050),     # Berlin
+    "FR": (48.8566, 2.3522),      # Paris
+    "ES": (40.4168, -3.7038),     # Madrid
+    "IT": (41.9028, 12.4964),     # Rome
+    "NL": (52.3676, 4.9041),      # Amsterdam
+    "PL": (52.2297, 21.0122),     # Warsaw
+    "BR": (-23.5505, -46.6333),   # São Paulo
+    "AE": (25.2048, 55.2708),     # Dubai
+    "CL": (-33.4489, -70.6693),   # Santiago
+    "MX": (19.4326, -99.1332),    # Mexico City
+    "AR": (-34.6037, -58.3816),   # Buenos Aires
+}
+
+# Latched off once the backend refuses the field, so a parameter that one
+# backend does not accept costs one prompt rather than every prompt. The
+# alternative — retrying each time — doubles the bill for the whole audit to
+# re-learn the same no.
+_gemini_retrieval_ok = True
+
+
+def _country_code(country: str) -> str:
+    """ISO-style code, with the one alias the rest of the file already carries.
+
+    "UK" appears throughout because DataForSEO is given it, but it is not a
+    region subtag: "en-UK" is not a language code and "en-GB" is.
+    """
+    code = (country or "").strip().upper()
+    return "GB" if code == "UK" else code
+
+
+def _gemini_retrieval(country: str):
+    """The market, in the two forms Gemini accepts, or None when neither is known.
+
+    The language comes from DATAFORSEO_LANGUAGES rather than a second table of
+    its own: it already answers "what language is a search in this market
+    answered in", which is the same question, and two tables would drift.
+    """
+    code = _country_code(country)
+    point = COUNTRY_LATLNG.get(code)
+    lang = DATAFORSEO_LANGUAGES.get(code)
+    if not point and not lang:
+        return None
+    return genai_types.RetrievalConfig(
+        lat_lng=(genai_types.LatLng(latitude=point[0], longitude=point[1])
+                 if point else None),
+        language_code=(f"{lang}-{code}" if lang and code else lang),
+    )
+
+
+async def ask_gemini(prompt: str, country: str = "") -> str:
+    global _gemini_retrieval_ok
     if not GEMINI_ENABLED:
         MODEL_ERRORS["gemini"] = "disabled"
         return ""
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"tools": [{"google_search": {}}]}
-        )
-        text = response.text or ""
-        # Same shape as the OpenAI path, so link extraction and the Sources list on
-        # screen do not have to know which model answered.
-        urls = _collect_gemini_urls(response)
-        if urls:
-            text += "\n\nSources: " + " ".join(urls)
-        print(f"Gemini OK: {len(text)} chars, {len(urls)} cited urls")
-        return text
-    except Exception as e:
-        print(f"Gemini error: {e}")
-        MODEL_ERRORS["gemini"] = str(e)[:300]
-        return ""
+
+    retrieval = _gemini_retrieval(country) if _gemini_retrieval_ok else None
+    for attempt in ("located", "plain"):
+        config: dict = {"tools": [{"google_search": {}}]}
+        if retrieval is not None and attempt == "located":
+            config["tool_config"] = genai_types.ToolConfig(retrieval_config=retrieval)
+        try:
+            response = gemini_client().models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=config,
+            )
+            text = response.text or ""
+            # Same shape as the OpenAI path, so link extraction and the Sources list on
+            # screen do not have to know which model answered.
+            urls = _collect_gemini_urls(response)
+            if urls:
+                text += "\n\nSources: " + " ".join(urls)
+            where = " (located)" if config.get("tool_config") else ""
+            print(f"Gemini OK{where}: {len(text)} chars, {len(urls)} cited urls")
+            MODEL_ERRORS.pop("gemini", None)
+            return text
+        except Exception as e:
+            # A backend that will not take the location should cost the location,
+            # not the model. Drop it, say so once, and ask the question again
+            # plainly — an unlocalised answer is worth more than no answer, as
+            # long as nobody is told it was localised.
+            if attempt == "located" and retrieval is not None:
+                print(f"Gemini refused the location, retrying without it: {e}")
+                _gemini_retrieval_ok = False
+                retrieval = None
+                continue
+            print(f"Gemini error: {e}")
+            MODEL_ERRORS["gemini"] = str(e)[:300]
+            return ""
+    return ""
 
 """Perplexity moved Sonar off /chat/completions onto the Agent API, and the two
 descriptions of where it went disagree: the live API's own 403 says
@@ -1117,9 +1327,8 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
         return {}
 
     code = (country or "").upper()
-    location = DATAFORSEO_LOCATIONS.get(code, DATAFORSEO_DEFAULT_LOCATION)
+    location, language = dataforseo_market(country)
     loc_code = DATAFORSEO_LOCATION_CODES.get(code)
-    language = DATAFORSEO_LANGUAGES.get(code, DATAFORSEO_DEFAULT_LANGUAGE)
 
     # Request shapes, most likely first, tried until one answers.
     #
@@ -1222,8 +1431,7 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
     if not AI_OVERVIEW_ENABLED:
         MODEL_ERRORS["ai_overview"] = "disabled"
         return ""
-    location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
-    language = DATAFORSEO_LANGUAGES.get((country or "").upper(), DATAFORSEO_DEFAULT_LANGUAGE)
+    location, language = dataforseo_market(country)
     try:
         async with _dataforseo_gate:
             # Checked inside the gate, not before it: a prompt that waited its
@@ -1348,7 +1556,7 @@ async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -
         last_error = None
         for model in [OPENAI_UTILITY_MODEL] + OPENAI_UTILITY_FALLBACKS:
             try:
-                response = await openai_client.responses.create(
+                response = await openai_client().responses.create(
                     model=model,
                     input=prompt,
                     max_output_tokens=MAX_ANSWER_TOKENS,
@@ -1364,7 +1572,7 @@ async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -
     last_error = None
     for model in [OPENAI_SEARCH_MODEL] + OPENAI_SEARCH_FALLBACKS:
         try:
-            response = await openai_client.responses.create(
+            response = await openai_client().responses.create(
                 model=model,
                 tools=[search_tool(country)],
                 input=prompt,
@@ -1395,7 +1603,7 @@ async def ask_openai(prompt: str, use_search: bool = False, country: str = "") -
 # one failure mode the registry exists to prevent.
 ASK.update({
     "chatgpt": lambda prompt, country: ask_openai(prompt, use_search=True, country=country),
-    "gemini": lambda prompt, country: ask_gemini(prompt),
+    "gemini": lambda prompt, country: ask_gemini(prompt, country=country),
     "perplexity": lambda prompt, country: ask_perplexity(prompt, country=country),
     "deepseek": lambda prompt, country: ask_deepseek(prompt, country=country),
     "ai_overview": lambda prompt, country: ask_ai_overview(prompt, country=country),
@@ -2515,7 +2723,7 @@ async def clear_cache():
 @app.get("/debug-prompt", dependencies=[Depends(caller)])
 async def debug_prompt(q: str = "best AI visibility tracking tools", country: str = ""):
     try:
-        response = await openai_client.responses.create(
+        response = await openai_client().responses.create(
             model=OPENAI_SEARCH_MODEL,
             tools=[search_tool(country)],
             input=q,
@@ -3245,8 +3453,7 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
     """
     if not KEYWORD_VOLUME_ENABLED or dataforseo_locked() or not keywords:
         return {}
-    location = DATAFORSEO_LOCATIONS.get((country or "").upper(), DATAFORSEO_DEFAULT_LOCATION)
-    language = DATAFORSEO_LANGUAGES.get((country or "").upper(), DATAFORSEO_DEFAULT_LANGUAGE)
+    location, language = dataforseo_market(country)
     try:
         async with _dataforseo_gate:
             if dataforseo_locked():
