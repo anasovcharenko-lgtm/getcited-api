@@ -543,6 +543,22 @@ MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
 
 MODEL_ERRORS: dict[str, str] = {}
 
+# Prompts where the thing being measured turned out not to exist — as opposed
+# to existing and going unmeasured. Model -> the prompts it found nothing at.
+#
+# Only AI Overviews can be in here, and only because it is not a model: it is a
+# block on a Google results page, and Google draws that block for some queries
+# and not others. A local query gets a map instead, a navigational one gets the
+# site, and plenty get nothing at all.
+#
+# Both outcomes reach the row as an empty answer, which made them one fact on
+# screen when they are opposites. "Checked, and there was no overview" says
+# nobody is cited there — not this brand, not any competitor — and that is a
+# finding about the market worth more than most of the measurements around it.
+# "Could not check" says nothing about anything. Keeping them apart is what
+# lets the report state the first instead of apologising for the second.
+MODEL_ABSENT: dict[str, set[str]] = {}
+
 # gpt-4o-search-preview was shut down on 2026-07-23. Web search now runs through
 # the Responses API web_search tool on a standard model. Override with env vars
 # if these names change again.
@@ -1495,6 +1511,11 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
         text, urls = _parse_ai_overview(task)
         MODEL_ERRORS.pop("ai_overview", None)
         if not text:
+            # Recorded, not just logged. Until now this fact lived in the
+            # deploy log and nowhere else, so the only way to tell a query
+            # Google draws no overview for from one we failed to fetch was to
+            # open a shell on the server.
+            MODEL_ABSENT.setdefault("ai_overview", set()).add(prompt)
             print(f"AI Overview: Google showed none for {prompt[:60]!r}")
             return ""
         if urls:
@@ -2258,6 +2279,14 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         # Per model, so whether one spoke is a count of what came back rather
         # than an inference from whichever prompt happened to fail last.
         "answers_by_model": answers_by_model,
+        # Of the prompts with no answer, the ones where there was nothing to
+        # answer with. Subtracting these from the silence leaves the part that
+        # is actually a gap — and it is the only part worth retrying, or
+        # apologising for.
+        "absent_by_model": {
+            m: sum(1 for r in results if (r.get(m) or {}).get("absent"))
+            for m in counted
+        },
         "total_prompts": len(results),
         "mentions_score": mentions_with_link_count,
         "citations_score": mentions_without_link_count,
@@ -2314,6 +2343,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         return {**cached[1], "from_cache": True}
 
     MODEL_ERRORS.clear()
+    MODEL_ABSENT.clear()
 
     brand_info = await enrich_brand(brand, description, website)
     # An undetermined category should not silently become "<brand> category":
@@ -2511,6 +2541,11 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
                 "sources": split_sources(answer)[1][:12],
                 "cited_domains": unique_domains(facts["urls"]),
             }
+            # Set only where it is true, so a row from an older run reads the
+            # same as one from today: absent is a claim, and its absence is
+            # not the opposite claim.
+            if prompt in MODEL_ABSENT.get(m, ()):
+                row[m]["absent"] = True
         results.append(row)
 
     # Discovery runs before aggregation because share of voice divides by every
@@ -2534,6 +2569,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     totals = aggregate_audit(results, running, brand, clean_brand, competitors,
                              competitor_domains, brand_domain)
     answered_by = totals["answers_by_model"]
+    absent_by = totals["absent_by_model"]
     gemini_mentions = totals["gemini_score"]
     openai_mentions = totals["chatgpt_score"]
     visibility_score = totals["visibility_score"]
@@ -2605,6 +2641,8 @@ Data: """ + summary)
                 "selected": m in running,
                 "answered": answered_by.get(m, 0),
                 "asked": len(results) if m in running else 0,
+                # Of the unanswered, how many had nothing there to answer.
+                "absent": absent_by.get(m, 0),
                 "error": (MODEL_ERRORS.get(m) if m in running
                           else "not selected for this audit")}
             for m in ALL_MODELS
@@ -2789,9 +2827,13 @@ async def add_models_to_audit(request: AddModelsRequest):
         # all of them; and a model already complete costs nothing and is told
         # so. Re-running the model wholesale would be simpler and would buy
         # nine answers that are already paid for and already on screen.
+        # A prompt already known to have nothing there is not a gap. Buying it
+        # again returns the same nothing, at the same price, for ever — which
+        # is what this did before the two kinds of silence were told apart.
         gaps = [(r.get("prompt") or "").strip() for r in previous
                 if (r.get("prompt") or "").strip()
-                and not ((r.get(m) or {}).get("answer") or "").strip()]
+                and not ((r.get(m) or {}).get("answer") or "").strip()
+                and not (r.get(m) or {}).get("absent")]
         if not gaps:
             skipped.append(m)
             continue
@@ -2866,12 +2908,14 @@ async def add_models_to_audit(request: AddModelsRequest):
     #
     # Anything derived from the answers has to come back with them.
     answered_by = totals["answers_by_model"]
+    absent_by = totals["absent_by_model"]
     model_status = {
         m: {"ok": answered_by.get(m, 0) > 0,
             "enabled": MODEL_SWITCHES[m](),
             "selected": m in running,
             "answered": answered_by.get(m, 0),
             "asked": len(previous) if m in running else 0,
+            "absent": absent_by.get(m, 0),
             # Only for models actually asked just now. MODEL_ERRORS is global
             # and the sub-audit cleared it, so it knows nothing about why a
             # model we did not touch was quiet last time — and inventing a
@@ -4179,6 +4223,7 @@ async def health_models():
     """Quick check of which AI models actually respond. Use this to tell a real
     'low visibility' result apart from 'the model never answered'."""
     MODEL_ERRORS.clear()
+    MODEL_ABSENT.clear()
     probe = "What is the best project management software? Name two tools."
     # Every registered model, including the ones switched off — a disabled model
     # reporting "disabled" here is the answer the endpoint exists to give.
