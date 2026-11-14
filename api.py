@@ -119,9 +119,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://djnvqoautxjyecfjuwhd.supabase.
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "sb_publishable_kBgEq9htfHu_1_2Eon_3nQ_ZbNzIlqo")
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
 FREE_AUDIT_LIMIT = int(os.getenv("FREE_AUDIT_LIMIT", "1"))
+# The default matters only where the variable is unset. If ADMIN_EMAILS exists
+# in the environment it replaces this list entirely rather than adding to it —
+# so an address added here and not there stays locked out, and the symptom is a
+# quota error on an account the code says is exempt.
 ADMIN_EMAILS = {e.strip().lower()
                 for e in os.getenv("ADMIN_EMAILS",
-                                   "anas.ovcharenko@gmail.com,anaovcharenko11@gmail.com").split(",")
+                                   "anas.ovcharenko@gmail.com,"
+                                   "anaovcharenko11@gmail.com,"
+                                   "ovcharenko.working@gmail.com").split(",")
                 if e.strip()}
 
 
