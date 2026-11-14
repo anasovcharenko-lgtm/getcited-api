@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urljoin, urlunparse
 import httpx
 load_dotenv()
 
@@ -306,6 +306,102 @@ def extract_urls(text: str) -> list[str]:
         if len(url) > 10:
             cleaned.append(url)
     return cleaned
+
+# Parameters that identify where a visitor came from, not which page they are
+# on. OpenAI appends utm_source=openai to everything it cites, HubSpot sites add
+# hsLang, and the rest are the usual ad and social trackers. Left in, they split
+# one page into several sources: an audit had the same FAQ twice, once at 1
+# citation and once at 4, because one copy of the link carried hsLang.
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_name", "hslang", "fbclid", "gclid", "yclid", "msclkid",
+    "mc_cid", "mc_eid", "igshid", "si", "ref_src", "spm", "_ga",
+}
+
+# Hosts that are a way to a source rather than one. A search results page is
+# not something a brand can appear "on" in any sense this audit means.
+_SEARCH_HOSTS = ("google.", "bing.com", "duckduckgo.com", "yandex.",
+                 "search.brave.com", "ecosia.org", "baidu.com")
+
+
+def is_search_page(url: str) -> bool:
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    host = u.netloc.lower().replace("www.", "")
+    if not any(host.startswith(h) or host == h.rstrip(".") for h in _SEARCH_HOSTS):
+        return False
+    # The host alone is not enough: news.google.com carries real articles, and
+    # a Google Doc is a page someone wrote. Only the search paths are dropped.
+    return u.path.rstrip("/") in ("", "/search", "/webhp", "/images", "/imghp")
+
+
+def is_redirect_url(url: str) -> bool:
+    """A wrapper Google hands out in place of the page it points at.
+
+    Gemini's grounding metadata returns vertexaisearch.cloud.google.com links,
+    and search results arrive as google.com/goto?url=<blob>. Both resolve to a
+    real page, and neither is one: stored as they came, every such citation
+    reports its domain as google.com, which is how an audit ends up with
+    twenty "sources" on a domain nobody writes anything on.
+    """
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    host = u.netloc.lower()
+    return (host.endswith("vertexaisearch.cloud.google.com")
+            or (host.endswith("google.com") and u.path.startswith("/goto")))
+
+
+def clean_source_url(url: str) -> str:
+    """One spelling per page: no fragment, no tracking, no trailing slash.
+
+    Remaining parameters are kept and sorted. They are kept because plenty of
+    sites put the article id in one; sorted because ?a=1&b=2 and ?b=2&a=1 are
+    the same page and should not be two rows in a table of sources.
+    """
+    try:
+        u = urlparse(url)
+    except Exception:
+        return url
+    kept = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+            if k.lower() not in _TRACKING_PARAMS]
+    query = urlencode(sorted(kept))
+    path = u.path.rstrip("/")
+    return urlunparse((u.scheme, u.netloc, path, "", query, ""))
+
+
+async def resolve_redirects(urls: set[str]) -> dict[str, str]:
+    """Follow the wrappers once each, and return what they point at.
+
+    A HEAD, because the body is not wanted here — the page itself is read
+    later, by the source check, and only for the handful the user asks about.
+    A wrapper that will not resolve keeps its own URL rather than being
+    dropped: a citation we cannot name is still a citation.
+    """
+    targets = [u for u in urls if is_redirect_url(u)]
+    if not targets:
+        return {}
+    out: dict[str, str] = {}
+    sem = asyncio.Semaphore(10)
+
+    async def one(client, url: str) -> None:
+        async with sem:
+            try:
+                r = await client.head(url, follow_redirects=True, timeout=10)
+                final = str(r.url)
+                if final and not is_redirect_url(final):
+                    out[url] = final
+            except Exception:
+                pass
+
+    async with httpx.AsyncClient(headers={"User-Agent": SOURCE_BROWSER_UA}) as client:
+        await asyncio.gather(*[one(client, u) for u in targets])
+    print(f"  resolved {len(out)}/{len(targets)} redirect link(s) to real pages")
+    return out
+
 
 def extract_domain(url: str) -> str:
     try:
@@ -2455,11 +2551,28 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     all_urls = {}
     sample_quote = ""
 
+    # Resolved once for the whole audit, before anything reads a URL. A link
+    # four models cited costs one request this way rather than four, and the
+    # work happens before any matching so nothing downstream has to know that
+    # a wrapper was ever involved.
+    redirect_map = await resolve_redirects({
+        u for _, answers in prompt_results
+        for a in (answers or {}).values()
+        for u in extract_urls(a or "")
+    })
+
     def process_model(prompt, answer, competitors):
         nonlocal all_urls
         answer_lower = answer.lower()
         name_mentioned = brand_in_text(answer, clean_brand)
-        urls = extract_urls(answer)
+
+        # Cleaned here, at the top, so everything below matches against a real
+        # page. A competitor's own link behind a Google wrapper matches no
+        # domain at all, and the answer would be filed as naming them without
+        # linking to them — a wrong verdict from a URL nobody could read.
+        urls = [clean_source_url(redirect_map.get(u, u)) for u in extract_urls(answer)]
+        urls = [u for u in urls if u and not is_search_page(u)]
+
         has_own_link = any(url_matches_name(u, brand_domain, clean_brand) for u in urls)
 
         competitors_with_link = []
@@ -2482,14 +2595,11 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         # citation. For deciding where to go and get mentioned it is not: the
         # site is not the place, the page is.
         #
-        # The fragment and a trailing slash are dropped so three spellings of
-        # one page do not become three sources. Anything further — query
-        # strings, tracking parameters — is left alone, because two URLs that
-        # differ there often really are two pages.
+        # Already cleaned above — wrappers resolved, tracking stripped, search
+        # pages dropped — so this only has to remove the repeats.
         cited = []
-        for u in urls:
-            page = u.split("#")[0].rstrip("/")
-            if page and page not in cited:
+        for page in urls:
+            if page not in cited:
                 cited.append(page)
             rec = all_urls.get(page)
             if rec is not None:
