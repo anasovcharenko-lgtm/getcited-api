@@ -2485,9 +2485,18 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             page = u.split("#")[0].rstrip("/")
             if page and page not in cited:
                 cited.append(page)
-            if page not in all_urls:
+            rec = all_urls.get(page)
+            if rec is not None:
+                # Which questions sent a model here, not just the first one.
+                # A page cited for one prompt out of ten and a page cited for
+                # six are different propositions, and "prompt" — singular, set
+                # on first sight — could not tell them apart.
+                if prompt not in rec["prompts"]:
+                    rec["prompts"].append(prompt)
+            else:
                 all_urls[page] = {"url": page, "domain": extract_domain(page),
                                   "total": 0, "prompt": prompt,
+                                  "prompts": [prompt],
                                   # A counter per registered model. The two
                                   # named ones are read by the stored-citation
                                   # merge in /audit/extend, so they keep their
@@ -2736,6 +2745,29 @@ Data: """ + summary)
 # Extending an audit: measure a few more prompts and fold them in
 # ─────────────────────────────────────────────────────────────
 
+def merge_citation(cur: dict, c: dict) -> None:
+    """Fold one citation record into another for the same page.
+
+    Counters add, prompts union.
+
+    Written once because the two callers had already drifted. The extend path
+    summed "gemini_count" and "chatgpt_count" by name and dropped the other
+    three models' citations on every merge — which is what a hand-written list
+    of two does the first time a third model exists, quietly and only on the
+    path that merges.
+    """
+    for k in [f"{m}_count" for m in ALL_MODELS] + ["total"]:
+        if k in c:
+            cur[k] = cur.get(k, 0) + c.get(k, 0)
+    seen = cur.setdefault("prompts", [])
+    # Records stored before prompts was a list carry the single "prompt" it
+    # replaced, so an audit extended today does not lose what it knew.
+    incoming = c.get("prompts") or ([c["prompt"]] if c.get("prompt") else [])
+    for p in incoming:
+        if p not in seen:
+            seen.append(p)
+
+
 class ExtendRequest(AuditRequest):
     """An audit already seen, plus the prompts to add to it.
 
@@ -2803,8 +2835,7 @@ async def extend_audit(request: ExtendRequest):
     for c in measured.get("citations", []):
         cur = by_page.get(c["url"])
         if cur:
-            for k in ("gemini_count", "chatgpt_count", "total"):
-                cur[k] = cur.get(k, 0) + c.get(k, 0)
+            merge_citation(cur, c)
         else:
             by_page[c["url"]] = dict(c)
     citations = sorted(by_page.values(), key=lambda x: x.get("total", 0), reverse=True)[:MAX_CITED_PAGES]
@@ -2931,9 +2962,7 @@ async def add_models_to_audit(request: AddModelsRequest):
     for c in citations_new:
         cur = by_page.get(c["url"])
         if cur:
-            for k in [f"{m}_count" for m in ALL_MODELS] + ["total"]:
-                if k in c:
-                    cur[k] = cur.get(k, 0) + c.get(k, 0)
+            merge_citation(cur, c)
         else:
             by_page[c["url"]] = dict(c)
     citations = sorted(by_page.values(), key=lambda x: x.get("total", 0), reverse=True)[:MAX_CITED_PAGES]
@@ -3999,28 +4028,32 @@ def _page_title(raw: str) -> str:
     return t[:PAGE_TITLE_LIMIT].rstrip() + "…" if len(t) > PAGE_TITLE_LIMIT else t
 
 
-async def _fetch_page_text(client, url: str) -> tuple[str, str, str]:
-    """Return (text, reason). Exactly one of them is non-empty.
+async def _fetch_page_text(client, url: str) -> tuple[str, str, str, str]:
+    """Return (text, reason, title, declared_kind).
 
-    The reason is written for whoever reads the report, not for a log file:
-    'we could not check this' is only useful if it also says why.
+    Exactly one of text and reason is non-empty. The reason is written for
+    whoever reads the report, not for a log file: "we could not check this" is
+    only useful if it also says why.
+
+    declared_kind is what the page claims to be in its own markup, and is
+    empty whenever it claims nothing.
     """
     try:
         r = await client.get(url, follow_redirects=True, timeout=SOURCE_CHECK_TIMEOUT,
                              headers={"User-Agent": SOURCE_BROWSER_UA})
     except httpx.TimeoutException:
-        return "", f"took longer than {SOURCE_CHECK_TIMEOUT}s to respond", ""
+        return "", f"took longer than {SOURCE_CHECK_TIMEOUT}s to respond", "", ""
     except httpx.ConnectError:
-        return "", "could not connect - domain may be dead or blocking us", ""
+        return "", "could not connect - domain may be dead or blocking us", "", ""
     except Exception as exc:
-        return "", f"fetch failed ({type(exc).__name__})", ""
+        return "", f"fetch failed ({type(exc).__name__})", "", ""
 
     if r.status_code != 200:
-        return "", _reason_for_status(r.status_code), ""
+        return "", _reason_for_status(r.status_code), "", ""
 
     ctype = r.headers.get("content-type", "").split(";")[0].strip()
     if ctype and "html" not in ctype:
-        return "", f"not a web page (content type: {ctype})", ""
+        return "", f"not a web page (content type: {ctype})", "", ""
 
     title = _page_title(r.text)
 
@@ -4028,15 +4061,49 @@ async def _fetch_page_text(client, url: str) -> tuple[str, str, str]:
     try:
         parser.feed(r.text)
     except Exception:
-        return "", "page markup could not be parsed", ""
+        return "", "page markup could not be parsed", "", ""
 
     text = parser.text()
     if len(text) < 400:
         # The title still goes back: the page was reachable, and its name is
         # worth more on screen than its slug even when the body is unreadable.
         return "", (f"only {len(text)} characters of text - the content is most likely "
-                    "rendered by JavaScript, which we cannot read"), title
-    return text, "", title
+                    "rendered by JavaScript, which we cannot read"), title, _declared_kind(r.text)
+    return text, "", title, _declared_kind(r.text)
+
+
+# What the page says it is, in its own schema.org markup.
+#
+# The alternative was guessing a news site from its domain, which means keeping
+# a list of publications and being wrong about every one not on it — and wrong
+# silently, filing a trade magazine under "everything else". A page that
+# declares NewsArticle is making that claim itself, for Google's benefit, and
+# has no reason to lie about it.
+#
+# Empty when the page declares nothing, which is common. The caller falls back
+# to reading the host and the title, so this sharpens the answer where it
+# exists rather than being the only way to one.
+_SCHEMA_KINDS = [
+    (("newsarticle", "blogposting", "article", "reportagenewsarticle"), "article"),
+    (("itemlist",), "list"),
+    (("videoobject",), "video"),
+    (("discussionforumposting", "socialmediaposting", "question", "answer"), "discussion"),
+    (("faqpage",), "faq"),
+    (("product", "offer", "localbusiness", "store", "organization"), "listing"),
+]
+
+
+def _declared_kind(html: str) -> str:
+    types = {m.group(1).lower() for m in re.finditer(r'"@type"\s*:\s*"([^"]+)"', html or "")}
+    if not types:
+        return ""
+    # Ordered, not scored: a page is often several of these at once — an
+    # article on a site that also declares its Organization — and the list runs
+    # most specific first so the outer wrapper does not win.
+    for names, kind in _SCHEMA_KINDS:
+        if types.intersection(names):
+            return kind
+    return ""
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 REDDIT_COMMENT_LIMIT = int(os.getenv("REDDIT_COMMENT_LIMIT", "60"))
@@ -4222,19 +4289,26 @@ async def source_gap(request: SourceGapRequest):
             # Declared up front because only the plain-page branch produces one;
             # Reddit and YouTube go through their own fetchers.
             page_title = ""
+            # Those two need no markup to be classified — the host says what
+            # they are, and saying it here keeps the frontend from having to
+            # special-case them a second time.
+            declared = ""
             async with sem:
                 if _is_reddit(url):
                     text, comment_text, reason = await _fetch_reddit(client, url)
+                    declared = "discussion"
                 elif _is_youtube(url):
                     text, reason = await _fetch_youtube(client, url)
+                    declared = "video"
                 else:
-                    text, reason, page_title = await _fetch_page_text(client, url)
+                    text, reason, page_title, declared = await _fetch_page_text(client, url)
 
             domain = re.sub(r"^www\.", "", re.sub(r"https?://", "", url).split("/")[0])
             # The title travels with every verdict, including the failures: a
             # page can be reachable and still unreadable, and its name is worth
             # more on screen than 120 characters of slug either way.
-            base = {"url": url, "domain": domain, "title": page_title}
+            base = {"url": url, "domain": domain, "title": page_title,
+                    "declared_kind": declared}
 
             if reason:
                 return {**base, "status": "unreadable", "reason": reason,
