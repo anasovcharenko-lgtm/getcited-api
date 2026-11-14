@@ -541,6 +541,13 @@ MAX_EXTRA_PROMPTS = int(os.getenv("MAX_EXTRA_PROMPTS", "20"))
 # reasoning tokens, so setting it too low returns an EMPTY answer with no error.
 MAX_ANSWER_TOKENS = int(os.getenv("MAX_ANSWER_TOKENS", "2500"))
 
+# How many cited pages to keep. This was ten, back when a record stood for a
+# whole domain; now that each one is a page, ten would be two or three sites.
+# The ceiling is on the stored list, not on the pages the browser later fetches
+# to check — that is a separate and much more expensive budget, kept on its own
+# side in the panel that spends it.
+MAX_CITED_PAGES = int(os.getenv("MAX_CITED_PAGES", "60"))
+
 MODEL_ERRORS: dict[str, str] = {}
 
 # Prompts where the thing being measured turned out not to exist — as opposed
@@ -2461,21 +2468,43 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             else:
                 competitors_without_link.append(c)
 
+        # Per page, not per site.
+        #
+        # This kept one record per domain and the first URL that reached it, so
+        # "reddit.com, cited 12 times" carried a single thread and the other
+        # eleven pages were gone. For a score that is enough — a citation is a
+        # citation. For deciding where to go and get mentioned it is not: the
+        # site is not the place, the page is.
+        #
+        # The fragment and a trailing slash are dropped so three spellings of
+        # one page do not become three sources. Anything further — query
+        # strings, tracking parameters — is left alone, because two URLs that
+        # differ there often really are two pages.
+        cited = []
         for u in urls:
-            domain = extract_domain(u)
-            if domain not in all_urls:
-                all_urls[domain] = {"url": u, "domain": domain, "total": 0,
-                                    "prompt": prompt,
-                                    # A counter per registered model. The two
-                                    # named ones are read by the stored-citation
-                                    # merge in /audit/extend, so they keep their
-                                    # keys whether or not those models ran.
-                                    **{f"{m}_count": 0 for m in ALL_MODELS}}
+            page = u.split("#")[0].rstrip("/")
+            if page and page not in cited:
+                cited.append(page)
+            if page not in all_urls:
+                all_urls[page] = {"url": page, "domain": extract_domain(page),
+                                  "total": 0, "prompt": prompt,
+                                  # A counter per registered model. The two
+                                  # named ones are read by the stored-citation
+                                  # merge in /audit/extend, so they keep their
+                                  # keys whether or not those models ran.
+                                  **{f"{m}_count": 0 for m in ALL_MODELS}}
 
         return {
             "name_mentioned": name_mentioned,
             "has_own_link": has_own_link,
             "urls": urls,
+            # Deduplicated, because the counters downstream are counting
+            # answers that cite a page, not times the string appears. Gemini
+            # and OpenAI have their sources appended to the answer text, so a
+            # page named in the body and again in that list was being counted
+            # twice — not an edge case but the ordinary path, quietly doubling
+            # the better-behaved models' citations against everyone else's.
+            "cited": cited,
             "competitors_with_link": competitors_with_link,
             "competitors_without_link": competitors_without_link,
         }
@@ -2518,10 +2547,11 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             answer = answers.get(m, "")
             facts = process_model(prompt, answer, competitors)
 
-            for u in facts["urls"]:
-                domain = extract_domain(u)
-                all_urls[domain][f"{m}_count"] += 1
-                all_urls[domain]["total"] += 1
+            # One increment per answer that cites the page, which is what the
+            # number is read as everywhere it is shown.
+            for page in facts["cited"]:
+                all_urls[page][f"{m}_count"] += 1
+                all_urls[page]["total"] += 1
 
             mentioned = facts["name_mentioned"]
             with_link = mentioned and facts["has_own_link"]
@@ -2579,7 +2609,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     competitor_stats = totals["competitor_ranking"]
 
 
-    citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:10]
+    citations = sorted(all_urls.values(), key=lambda x: x["total"], reverse=True)[:MAX_CITED_PAGES]
     summary = "Brand: " + clean_brand + ", Category: " + category + ", Score: " + str(visibility_score) + "%"
 
     rec_response = "" if request.skip_recommendations else await ask_openai(
@@ -2620,6 +2650,13 @@ Data: """ + summary)
         # What was asked, and what actually came back. A model can be in the
         # first list and absent from the second: selected, called, and silent.
         "models_answered": totals["models_answered"],
+        # The raw counts as well as the per-model blocks below that reshape
+        # them. The guard at the end of this function was already logging these
+        # two as dropped: they reach the screen only inside model_status, and
+        # anything reading the stored payload for its own purposes — the link
+        # work above, a later report — should not have to take them apart.
+        "answers_by_model": totals["answers_by_model"],
+        "absent_by_model": totals["absent_by_model"],
         "models_available": available_models(),
         # Built from the registry, so a model added later reports its status
         # without this block being touched. "did not run" and "ran and found
@@ -2759,15 +2796,18 @@ async def extend_audit(request: ExtendRequest):
                              competitors, competitor_domains, brand_domain)
 
     # Citation counts add up by domain; the list stays capped the same way.
-    by_domain = {c["domain"]: dict(c) for c in (request.previous_citations or [])}
+    # Keyed by page, because a record is a page now. Keying by domain would
+    # fold every page of a site into whichever one arrived first — the exact
+    # collapse this change exists to undo.
+    by_page = {c["url"]: dict(c) for c in (request.previous_citations or [])}
     for c in measured.get("citations", []):
-        cur = by_domain.get(c["domain"])
+        cur = by_page.get(c["url"])
         if cur:
             for k in ("gemini_count", "chatgpt_count", "total"):
                 cur[k] = cur.get(k, 0) + c.get(k, 0)
         else:
-            by_domain[c["domain"]] = dict(c)
-    citations = sorted(by_domain.values(), key=lambda x: x.get("total", 0), reverse=True)[:10]
+            by_page[c["url"]] = dict(c)
+    citations = sorted(by_page.values(), key=lambda x: x.get("total", 0), reverse=True)[:MAX_CITED_PAGES]
 
     print(f"  extended audit: {len(previous)} + {len(measured['results'])} = {len(merged)} prompts")
 
@@ -2884,16 +2924,19 @@ async def add_models_to_audit(request: AddModelsRequest):
     totals = aggregate_audit(previous, running, request.brand, clean_brand,
                              competitors, competitor_domains, brand_domain)
 
-    by_domain = {c["domain"]: dict(c) for c in (request.previous_citations or [])}
+    # Keyed by page, because a record is a page now. Keying by domain would
+    # fold every page of a site into whichever one arrived first — the exact
+    # collapse this change exists to undo.
+    by_page = {c["url"]: dict(c) for c in (request.previous_citations or [])}
     for c in citations_new:
-        cur = by_domain.get(c["domain"])
+        cur = by_page.get(c["url"])
         if cur:
             for k in [f"{m}_count" for m in ALL_MODELS] + ["total"]:
                 if k in c:
                     cur[k] = cur.get(k, 0) + c.get(k, 0)
         else:
-            by_domain[c["domain"]] = dict(c)
-    citations = sorted(by_domain.values(), key=lambda x: x.get("total", 0), reverse=True)[:10]
+            by_page[c["url"]] = dict(c)
+    citations = sorted(by_page.values(), key=lambda x: x.get("total", 0), reverse=True)[:MAX_CITED_PAGES]
 
     print(f"  added models {added} over {len(previous)} prompts"
           + (f", already complete: {skipped}" if skipped else ""))
