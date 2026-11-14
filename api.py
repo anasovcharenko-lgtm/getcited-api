@@ -2693,7 +2693,18 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
                 "competitors_with_link": facts["competitors_with_link"],
                 "competitors_without_link": facts["competitors_without_link"],
                 "answer": trim_answer(answer),
-                "sources": split_sources(answer)[1][:12],
+                # The cleaned list, not a second parse of the answer text.
+                #
+                # This read split_sources(answer) and so walked straight past
+                # the resolving and de-duplicating done at the top of
+                # process_model: under a Gemini answer it printed nine
+                # vertexaisearch.cloud.google.com/grounding-api-redirect links,
+                # which name nothing and lead nowhere a reader would recognise.
+                #
+                # Taking facts["cited"] also means the list under an answer and
+                # the citation counts are the same set of pages. Two parses of
+                # the same text are two chances to disagree.
+                "sources": facts["cited"][:12],
                 "cited_domains": unique_domains(facts["urls"]),
             }
             # Set only where it is true, so a row from an older run reads the
