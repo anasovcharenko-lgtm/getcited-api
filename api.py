@@ -652,6 +652,47 @@ MAX_CITED_PAGES = int(os.getenv("MAX_CITED_PAGES", "60"))
 
 MODEL_ERRORS: dict[str, str] = {}
 
+# Why a model failed, counted, and not erased by a later success.
+#
+# MODEL_ERRORS holds one string per model, written by whichever prompt finished
+# last and cleared by any prompt that worked. With ten prompts running at once
+# that makes it a lottery, and it lost a real finding twice: Perplexity answered
+# one prompt in ten, the one success popped the key, and the audit reported nine
+# silent prompts with no reason attached to any of them. A tally cannot be
+# cleared by good news.
+MODEL_FAILURES: dict[str, dict[str, int]] = {}
+
+
+def note_failure(model: str, reason: str) -> None:
+    MODEL_FAILURES.setdefault(model, {})
+    MODEL_FAILURES[model][reason] = MODEL_FAILURES[model].get(reason, 0) + 1
+
+
+def failure_summary(model: str) -> str:
+    """"9 x rate limited (429), 1 x timeout" — what actually went wrong, and
+    how often. The count is the part that tells a one-off from a wall."""
+    counts = MODEL_FAILURES.get(model) or {}
+    if not counts:
+        return ""
+    return ", ".join(f"{n} x {reason}" for reason, n
+                     in sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def model_error(model: str, ran: bool) -> str | None:
+    """What to show against a model, counting the prompts it dropped.
+
+    A model that answered some prompts and failed others used to arrive here
+    with nothing: the successes cleared the single error slot. So "answered 1
+    of 10" reached the screen as a bare gap with no cause, and the cause was a
+    rate limit the whole time.
+    """
+    if not ran:
+        return "not selected for this audit"
+    last, tally = MODEL_ERRORS.get(model), failure_summary(model)
+    if last and tally:
+        return f"{tally} - last: {last}"
+    return last or tally or None
+
 # Prompts where the thing being measured turned out not to exist — as opposed
 # to existing and going unmeasured. Model -> the prompts it found nothing at.
 #
@@ -1129,6 +1170,49 @@ again, the fix is a line in this list rather than a rewrite.
 
 PERPLEXITY_PRESET = os.getenv("PERPLEXITY_PRESET", "fast")
 
+# Perplexity's Agent API is rate limited to one request per second on tier 0,
+# counted across the whole organisation rather than per key.
+#
+# An audit fires every prompt at every model at once. Against a one-second
+# window that means exactly one prompt gets through and the rest come back 429,
+# which is precisely what two consecutive runs showed: Perplexity answered one
+# prompt in ten, twice, while the credits were paid and the endpoint was right.
+# It did not look like a rate limit because nothing retried and the single
+# success erased the error.
+#
+# Below the ceiling on purpose: the limit is organisation-wide, so a second
+# audit running elsewhere is spending the same second.
+PERPLEXITY_QPS = float(os.getenv("PERPLEXITY_QPS", "0.8"))
+PERPLEXITY_RETRIES = int(os.getenv("PERPLEXITY_RETRIES", "4"))
+
+_perplexity_pace = asyncio.Lock()
+_perplexity_last = 0.0
+
+
+async def _perplexity_slot() -> None:
+    """Wait until the vendor's window has room for one more request.
+
+    A semaphore would cap how many run at once, which is not the limit being
+    enforced: one request per second is about how often a request may START,
+    whatever is still in flight. So this spaces departures instead, and holds
+    the lock while it waits so ten callers queue rather than all reading the
+    same timestamp and leaving together.
+    """
+    global _perplexity_last
+    async with _perplexity_pace:
+        gap = 1.0 / PERPLEXITY_QPS if PERPLEXITY_QPS > 0 else 0.0
+        wait = _perplexity_last + gap - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _perplexity_last = time.monotonic()
+
+
+def _retry_after(resp) -> float:
+    try:
+        return max(0.0, float(resp.headers.get("Retry-After", "")))
+    except (TypeError, ValueError):
+        return 0.0
+
 PERPLEXITY_SHAPES: list[tuple[str, str]] = [
     # (path, how the body names the thing to run)
     ("/v1/responses", "model"),   # what the live 403 pointed at
@@ -1249,13 +1333,26 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
     for i in order:
         path, kind = PERPLEXITY_SHAPES[i]
         try:
-            async with httpx.AsyncClient(timeout=90) as client:
-                resp = await client.post(
-                    f"https://api.perplexity.ai{path}",
-                    headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                             "Content-Type": "application/json"},
-                    json=_perplexity_body(kind, prompt),
-                )
+            for attempt in range(PERPLEXITY_RETRIES + 1):
+                await _perplexity_slot()
+                async with httpx.AsyncClient(timeout=90) as client:
+                    resp = await client.post(
+                        f"https://api.perplexity.ai{path}",
+                        headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                                 "Content-Type": "application/json"},
+                        json=_perplexity_body(kind, prompt),
+                    )
+                if resp.status_code != 429:
+                    break
+                # The pacing above should keep us under the window, but the
+                # limit is organisation-wide and this process is not the only
+                # thing that can spend it. Waiting is the whole fix: a 429 is
+                # the one failure where trying the same request again later is
+                # certain to be the right move, and dropping it loses a prompt
+                # we have already decided to pay for.
+                if attempt == PERPLEXITY_RETRIES:
+                    break
+                await asyncio.sleep(_retry_after(resp) or min(2 ** attempt, 8))
             if resp.status_code >= 400:
                 note = f"{resp.status_code} on {path}: {resp.text[:200]}"
                 tried.append(note)
@@ -1264,7 +1361,16 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
                 # stop rather than turn one clear failure into three. 403 is not
                 # treated that way: the migration notice arrives as a 403.
                 if resp.status_code == 401:
+                    note_failure("perplexity", "bad key (401)")
                     break
+                # Nor is a 429 about the shape. Walking the other two paths
+                # during a rate limit spends the next two windows proving the
+                # same thing, and takes the windows from prompts that could
+                # have used them.
+                if resp.status_code == 429:
+                    note_failure("perplexity", "rate limited (429)")
+                    break
+                note_failure("perplexity", f"HTTP {resp.status_code}")
                 continue
 
             data = resp.json()
@@ -1278,6 +1384,7 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
                 note = f"{path} returned status={state}: {str(data.get('error'))[:200]}"
                 tried.append(note)
                 print(f"Perplexity {note}")
+                note_failure("perplexity", f"status={state}")
                 continue
 
             text = _perplexity_text(data)
@@ -1285,6 +1392,7 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
                 note = f"{path} answered with no text: {str(data)[:200]}"
                 tried.append(note)
                 print(f"Perplexity {note}")
+                note_failure("perplexity", "answered with no text")
                 continue
 
             urls = _perplexity_urls(data)
@@ -1300,6 +1408,7 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
             note = f"{path}: {str(e)[:200]}"
             tried.append(note)
             print(f"Perplexity error on {note}")
+            note_failure("perplexity", type(e).__name__)
             continue
 
     # Every shape's failure, not only the last one attempted. The old line
@@ -2453,6 +2562,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
 
     MODEL_ERRORS.clear()
     MODEL_ABSENT.clear()
+    MODEL_FAILURES.clear()
 
     brand_info = await enrich_brand(brand, description, website)
     # An undetermined category should not silently become "<brand> category":
@@ -2816,8 +2926,7 @@ Data: """ + summary)
                 "asked": len(results) if m in running else 0,
                 # Of the unanswered, how many had nothing there to answer.
                 "absent": absent_by.get(m, 0),
-                "error": (MODEL_ERRORS.get(m) if m in running
-                          else "not selected for this audit")}
+                "error": model_error(m, m in running)}
             for m in ALL_MODELS
         },
         "visibility_score": visibility_score,
@@ -3120,7 +3229,7 @@ async def add_models_to_audit(request: AddModelsRequest):
             # model we did not touch was quiet last time — and inventing a
             # reason is worse than leaving the field empty next to a count
             # that already says what happened.
-            "error": (MODEL_ERRORS.get(m) if m in added
+            "error": (model_error(m, True) if m in added
                       else (None if m in running else "not selected for this audit"))}
         for m in ALL_MODELS
     }
@@ -4468,6 +4577,7 @@ async def health_models():
     'low visibility' result apart from 'the model never answered'."""
     MODEL_ERRORS.clear()
     MODEL_ABSENT.clear()
+    MODEL_FAILURES.clear()
     probe = "What is the best project management software? Name two tools."
     # Every registered model, including the ones switched off — a disabled model
     # reporting "disabled" here is the answer the endpoint exists to give.
