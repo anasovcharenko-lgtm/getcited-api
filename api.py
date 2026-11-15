@@ -765,6 +765,17 @@ DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
 AI_OVERVIEW_ENABLED = (os.getenv("AI_OVERVIEW_ENABLED", "false").lower() == "true"
                        and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
 
+# The same account and the same credit pool, reading Bing instead of Google.
+#
+# Off by default, and deliberately so until a real run has been looked at. The
+# vendor documents neither which countries Copilot draws a summary in nor
+# whether it behaves outside English, and a model that silently returns nothing
+# in Mexico would be reported as a brand absent from Copilot rather than as a
+# Copilot that was never there. That is the distinction this codebase keeps
+# having to defend, so the flag stays off until the answer is known.
+COPILOT_ENABLED = (os.getenv("COPILOT_ENABLED", "false").lower() == "true"
+                   and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
+
 # DataForSEO wants a place, not a country code.
 #
 # This table is the FALLBACK. The live list comes from DataForSEO itself (see
@@ -1151,6 +1162,7 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "perplexity": lambda: PERPLEXITY_ENABLED,
     "deepseek": lambda: DEEPSEEK_ENABLED,
     "ai_overview": lambda: AI_OVERVIEW_ENABLED,
+    "copilot": lambda: COPILOT_ENABLED,
 }
 ALL_MODELS = list(MODEL_SWITCHES)
 
@@ -1166,6 +1178,10 @@ MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     "perplexity": lambda: PERPLEXITY_MODEL,
     "deepseek": lambda: DEEPSEEK_MODEL,
     "ai_overview": lambda: "google ai overview via dataforseo",
+    # Named for the surface, not the brand: this is the summary on a Bing
+    # results page, not the Copilot app, and a stored run should not let the
+    # two be confused later.
+    "copilot": lambda: "bing copilot summary via dataforseo",
 }
 
 # How to ask each model. Filled in below as the ask_* functions are defined;
@@ -1844,6 +1860,49 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
     if not AI_OVERVIEW_ENABLED:
         MODEL_ERRORS["ai_overview"] = "disabled"
         return ""
+    return await _ask_serp_summary(
+        model="ai_overview", label="AI Overview", engine="Google",
+        endpoint="https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
+        # Without this the overview is missing from the response even when
+        # Google shows one on the page. Google's own parameter; Bing neither
+        # needs nor documents it.
+        extra={"load_async_ai_overview": True},
+        prompt=prompt, country=country)
+
+
+async def ask_copilot(prompt: str, country: str = "") -> str:
+    """The Copilot summary Bing shows for this query, via DataForSEO.
+
+    Everything in `ask_ai_overview`'s docstring applies here: not a model, not
+    an API Microsoft offers, a real search parsed out of the page, and an empty
+    answer meaning "no summary existed" rather than "you were not named".
+
+    What this measures is the Copilot summary on a Bing results page, not the
+    Copilot app at copilot.microsoft.com, which has no public API. Same engine
+    and same grounding, different surface. The interface says so, because a
+    number is only honest if what it counts is written next to it.
+    """
+    if not COPILOT_ENABLED:
+        MODEL_ERRORS["copilot"] = "disabled"
+        return ""
+    return await _ask_serp_summary(
+        model="copilot", label="Copilot", engine="Bing",
+        endpoint="https://api.dataforseo.com/v3/serp/bing/organic/live/advanced",
+        extra={}, prompt=prompt, country=country)
+
+
+async def _ask_serp_summary(*, model: str, label: str, engine: str,
+                            endpoint: str, extra: dict,
+                            prompt: str, country: str) -> str:
+    """The AI summary a search engine shows for a query, whichever engine.
+
+    Shared rather than copied. Google's version and Bing's differ by a URL and
+    one parameter, and this codebase has spent today paying for the alternative:
+    three hand-written copies of a country list that drifted until two markets
+    silently resolved to the wrong one. A second copy of ninety lines of error
+    handling would drift the same way, and the drift would be in the part that
+    decides whether a quota failure reads as "no summary for this query".
+    """
     location, language = dataforseo_market(country)
     try:
         async with _dataforseo_gate:
@@ -1851,65 +1910,67 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
             # turn must see a refusal that arrived while it waited.
             locked = dataforseo_locked()
             if locked:
-                MODEL_ERRORS["ai_overview"] = locked
+                MODEL_ERRORS[model] = locked
                 return ""
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
-                    "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
+                    endpoint,
                     auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
                     json=[{"keyword": prompt,
                            "location_name": location,
                            "language_code": language,
                            "device": "desktop",
-                           # Without this the overview is missing from the
-                           # response even when Google shows one on the page.
-                           "load_async_ai_overview": True}],
+                           **extra}],
                 )
         if resp.status_code >= 400:
             detail = dataforseo_reason(resp)
-            print(f"AI Overview error {detail}")
-            MODEL_ERRORS["ai_overview"] = detail
+            print(f"{label} error {detail}")
+            MODEL_ERRORS[model] = detail
+            note_failure(model, f"HTTP {resp.status_code}")
             if resp.status_code in (401, 402, 403, 429):
                 _lock_dataforseo(detail)
-                print("AI Overview: credentials refused, not calling again this run")
+                print(f"{label}: credentials refused, not calling again this run")
             return ""
         data = resp.json()
 
         # DataForSEO reports per-task failures inside a 200, so the status code
-        # alone would read a quota problem as "no overview for this query".
+        # alone would read a quota problem as "no summary for this query".
         tasks = data.get("tasks") or []
         if not tasks:
-            MODEL_ERRORS["ai_overview"] = f"no tasks in response: {str(data)[:200]}"
+            MODEL_ERRORS[model] = f"no tasks in response: {str(data)[:200]}"
+            note_failure(model, "no tasks in response")
             return ""
         task = tasks[0]
         if task.get("status_code", 20000) >= 40000:
             detail = f"{task.get('status_code')}: {task.get('status_message', '')[:200]}"
-            print(f"AI Overview task failed {detail}")
-            MODEL_ERRORS["ai_overview"] = detail
+            print(f"{label} task failed {detail}")
+            MODEL_ERRORS[model] = detail
+            note_failure(model, f"task {task.get('status_code')}")
             # A per-task failure about the account, not about this query, must
             # stop the remaining prompts too.
             if task.get("status_code") in DATAFORSEO_FATAL:
                 _lock_dataforseo(detail)
-                print("AI Overview: account refused, not calling again this run")
+                print(f"{label}: account refused, not calling again this run")
             return ""
 
         text, urls = _parse_ai_overview(task)
-        MODEL_ERRORS.pop("ai_overview", None)
+        MODEL_ERRORS.pop(model, None)
         if not text:
             # Recorded, not just logged. Until now this fact lived in the
-            # deploy log and nowhere else, so the only way to tell a query
-            # Google draws no overview for from one we failed to fetch was to
+            # deploy log and nowhere else, so the only way to tell a query the
+            # engine draws no summary for from one we failed to fetch was to
             # open a shell on the server.
-            MODEL_ABSENT.setdefault("ai_overview", set()).add(prompt)
-            print(f"AI Overview: Google showed none for {prompt[:60]!r}")
+            MODEL_ABSENT.setdefault(model, set()).add(prompt)
+            print(f"{label}: {engine} showed none for {prompt[:60]!r}")
             return ""
         if urls:
             text += "\n\nSources: " + " ".join(urls)
-        print(f"AI Overview OK: {len(text)} chars, {len(urls)} references")
+        print(f"{label} OK: {len(text)} chars, {len(urls)} references")
         return text
     except Exception as e:
-        print(f"AI Overview error: {e}")
-        MODEL_ERRORS["ai_overview"] = str(e)[:300]
+        print(f"{label} error: {e}")
+        MODEL_ERRORS[model] = str(e)[:300]
+        note_failure(model, type(e).__name__)
         return ""
 
 
@@ -2025,6 +2086,7 @@ ASK.update({
     "perplexity": lambda prompt, country: ask_perplexity(prompt, country=country),
     "deepseek": lambda prompt, country: ask_deepseek(prompt, country=country),
     "ai_overview": lambda prompt, country: ask_ai_overview(prompt, country=country),
+    "copilot": lambda prompt, country: ask_copilot(prompt, country=country),
 })
 assert set(ASK) == set(ALL_MODELS), (
     f"registry and ASK disagree: {set(ALL_MODELS) ^ set(ASK)}")
@@ -4080,11 +4142,15 @@ CRAWLER_OPERATOR_MODELS = {
     "OpenAI": ["chatgpt"],
     "Google": ["gemini", "ai_overview"],
     "Perplexity": ["perplexity"],
+    # bingbot is what grounds the Copilot summary, so blocking it is what costs
+    # visibility there — msnbot is the same crawler's older name.
+    "Microsoft": ["copilot"],
 }
 
 MODEL_LABELS = {
     "chatgpt": "ChatGPT", "gemini": "Gemini", "perplexity": "Perplexity",
     "deepseek": "DeepSeek", "ai_overview": "Google AI Overview",
+    "copilot": "Copilot",
 }
 
 
