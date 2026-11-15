@@ -1953,15 +1953,28 @@ async def _ask_serp_summary(*, model: str, label: str, engine: str,
                 print(f"{label}: account refused, not calling again this run")
             return ""
 
-        text, urls = _parse_ai_overview(task)
+        text, urls, saw_item = _parse_ai_overview(task)
         MODEL_ERRORS.pop(model, None)
         if not text:
+            if saw_item:
+                # The engine DID draw a summary and we read nothing out of it.
+                # That is a fault in this code, and calling it absence would
+                # file our own blind spot under "nothing to measure" — which is
+                # exactly what happened when Bing's `snippet` went unread for a
+                # whole run, with the log agreeing. So it is an error, loudly,
+                # and it stays out of the absent count.
+                detail = (f"{engine} returned an ai_overview item but no text "
+                          f"could be read from it - parser gap, not absence")
+                print(f"{label}: {detail} ({prompt[:60]!r})")
+                MODEL_ERRORS[model] = detail
+                note_failure(model, "summary present but unread")
+                return ""
             # Recorded, not just logged. Until now this fact lived in the
             # deploy log and nowhere else, so the only way to tell a query the
             # engine draws no summary for from one we failed to fetch was to
             # open a shell on the server.
             MODEL_ABSENT.setdefault(model, set()).add(prompt)
-            print(f"{label}: {engine} showed none for {prompt[:60]!r}")
+            print(f"{label}: {engine} returned no ai_overview item for {prompt[:60]!r}")
             return ""
         if urls:
             text += "\n\nSources: " + " ".join(urls)
@@ -1974,7 +1987,7 @@ async def _ask_serp_summary(*, model: str, label: str, engine: str,
         return ""
 
 
-def _parse_ai_overview(task: dict) -> tuple[str, list[str]]:
+def _parse_ai_overview(task: dict) -> tuple[str, list[str], bool]:
     """The summary's prose and the pages it cites, out of a SERP response.
 
     Read defensively: this is a parsed page, not a documented model output, and
@@ -1995,10 +2008,16 @@ def _parse_ai_overview(task: dict) -> tuple[str, list[str]]:
     """
     parts: list[str] = []
     urls: list[str] = []
+    # Whether the engine drew a summary at all, which is a different fact from
+    # whether we managed to read one. Returned so the caller can tell the two
+    # apart; conflating them is how a working Copilot was reported as ten
+    # queries with nothing to measure, and how the log agreed with it.
+    saw_item = False
     for result in (task.get("result") or []):
         for item in ((result or {}).get("items") or []):
             if not isinstance(item, dict) or item.get("type") != "ai_overview":
                 continue
+            saw_item = True
             for el in (item.get("items") or []):
                 if not isinstance(el, dict):
                     continue
@@ -2025,7 +2044,8 @@ def _parse_ai_overview(task: dict) -> tuple[str, list[str]]:
             for ref in (item.get("references") or []):
                 if isinstance(ref, dict) and str(ref.get("url", "")).startswith("http"):
                     urls.append(ref["url"])
-    return "\n\n".join(p for p in parts if p).strip(), list(dict.fromkeys(urls))
+    return ("\n\n".join(p for p in parts if p).strip(),
+            list(dict.fromkeys(urls)), saw_item)
 
 
 def search_tool(country: str = "") -> dict:
