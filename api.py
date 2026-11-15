@@ -1975,10 +1975,23 @@ async def _ask_serp_summary(*, model: str, label: str, engine: str,
 
 
 def _parse_ai_overview(task: dict) -> tuple[str, list[str]]:
-    """The overview's prose and the pages it cites, out of a SERP response.
+    """The summary's prose and the pages it cites, out of a SERP response.
 
     Read defensively: this is a parsed page, not a documented model output, and
-    the shape changes when Google changes the block.
+    the shape changes when the engine changes the block.
+
+    Google and Bing both put their summary in an `ai_overview` item, which is
+    what made sharing this function look safe. One level down they do not
+    agree. Google writes prose into `markdown` or `text`; Bing's
+    `ai_overview_organic_element` carries a `snippet` beside its title and url,
+    and has no `text` field at all.
+
+    Reading only Google's two field names returned an empty string for every
+    Bing summary, and an empty string here means "the engine drew no summary" —
+    so a working Copilot reported ten queries in ten as nothing to measure.
+    The item type matched, the fields did not, and the failure wore the exact
+    costume this codebase keeps having to strip off: absent, when the truth was
+    present and unread.
     """
     parts: list[str] = []
     urls: list[str] = []
@@ -1989,7 +2002,21 @@ def _parse_ai_overview(task: dict) -> tuple[str, list[str]]:
             for el in (item.get("items") or []):
                 if not isinstance(el, dict):
                     continue
-                chunk = el.get("markdown") or el.get("text") or ""
+                # Bing's element for a page the summary drew on. Its url is a
+                # citation in every sense the audit means, and dropping it
+                # would undercount exactly the brands Copilot does name.
+                if str(el.get("url", "")).startswith("http"):
+                    urls.append(el["url"])
+                # `snippet` is Bing's; `title` carries meaning there too, since
+                # a Copilot element is a titled extract rather than a run of
+                # prose. Both are kept because a brand is as likely to be named
+                # in the heading as in the sentence under it.
+                chunk = el.get("markdown") or el.get("text") or el.get("snippet") or ""
+                title = el.get("title") or ""
+                if title and chunk and title not in chunk:
+                    chunk = f"{title}. {chunk}"
+                elif not chunk:
+                    chunk = title
                 if chunk:
                     parts.append(chunk)
                 for link in (el.get("links") or []):
