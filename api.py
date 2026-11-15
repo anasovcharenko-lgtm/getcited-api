@@ -1205,6 +1205,30 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
 }
 ALL_MODELS = list(MODEL_SWITCHES)
 
+# Measured, but never averaged into the headline score.
+#
+# Copilot's summary is a search feature, and it answers search phrases. Asked
+# the conversational prompts the chat models get, Bing drew no summary at all —
+# ten queries in ten, three runs running, confirmed by hand on bing.com. So
+# Copilot is asked the short phrase the prompt is about instead.
+#
+# Which means it is answering a different question from the rest, and a score
+# is only meaningful over one question. Averaged in, it would quietly turn the
+# headline into a blend of "what assistants say when asked a sentence" and
+# "what Bing summarises when typed a phrase" — two different things behind one
+# number, which is the fault this codebase exists to avoid. It gets its own
+# figure, beside the others, saying what it measured.
+SEPARATE_SCORE = {"copilot"}
+
+# The phrase a model should be asked, which is the prompt for everything but
+# Copilot. Falls back to the prompt when no phrase could be derived — rarely
+# useful against Bing, but it is a real measurement of a real query, and the
+# row records which one was asked.
+def query_for(model: str, prompt: str, phrases: dict[str, str]) -> str:
+    if model in SEPARATE_SCORE:
+        return phrases.get(prompt) or prompt
+    return prompt
+
 # The exact model string each one answers with, read at request time rather than
 # at import: these are env vars, and a run has to record what actually answered.
 MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
@@ -2735,7 +2759,11 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
     # could be added, could answer, could name the brand — and appear in none of
     # the numbers. The registry promises that adding a model takes four edits;
     # this is what has to be true for that promise to hold.
-    counted = [m for m in running if m in ALL_MODELS]
+    # Copilot is excluded here and scored on its own below. Doing it at this
+    # one line is deliberate: visibility, competitor ranking, share of voice
+    # and the citation counts all read `counted`, so none of them can pick up
+    # a model that was asked a different question.
+    counted = [m for m in running if m in ALL_MODELS and m not in SEPARATE_SCORE]
     per_model = {m: sum(1 for r in results if r.get(m, {}).get("mentioned"))
                  for m in ALL_MODELS}
     named_count = sum(per_model[m] for m in counted)
@@ -2750,12 +2778,19 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
     # competitor's rate, without anything on screen saying the figure had moved
     # for that reason. The same mistake as dividing by the models that exist
     # rather than the models that ran, one level further in.
+    # Over every model that ran, including the separately scored ones: these
+    # two report what each model did, and the banner, the tabs and the retry
+    # button all read them. Leaving Copilot out here would have hidden the one
+    # fact it currently has to offer — that Bing drew nothing — behind a pair
+    # of zeros.
+    reported = [m for m in running if m in ALL_MODELS]
     answers_by_model = {
         m: sum(1 for r in results if (r.get(m, {}).get("answer") or "").strip())
-        for m in counted
+        for m in reported
     }
-    answered_models = [m for m in counted if answers_by_model[m]]
-    total_checks = sum(answers_by_model.values())
+    answered_models = [m for m in reported if answers_by_model[m]]
+    # The denominator, however, is only the models answering the same question.
+    total_checks = sum(answers_by_model[m] for m in counted)
     visibility_score = (int(named_count / total_checks * 100)
                         if total_checks > 0 else 0)
 
@@ -2826,7 +2861,20 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
         # apologising for.
         "absent_by_model": {
             m: sum(1 for r in results if (r.get(m) or {}).get("absent"))
-            for m in counted
+            for m in reported
+        },
+        # Models asked a different question, each with its own score and its
+        # own denominator. Kept out of `visibility_score` on purpose; see
+        # SEPARATE_SCORE. A reader gets two honest numbers instead of one
+        # blended one.
+        "separate_scores": {
+            m: {"named": per_model.get(m, 0),
+                "answers": answers_by_model.get(m, 0),
+                "asked": len(results),
+                "absent": sum(1 for r in results if (r.get(m) or {}).get("absent")),
+                "score": (int(per_model.get(m, 0) / answers_by_model[m] * 100)
+                          if answers_by_model.get(m) else 0)}
+            for m in reported if m in SEPARATE_SCORE
         },
         "total_prompts": len(results),
         "mentions_score": mentions_with_link_count,
@@ -2947,15 +2995,19 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         """A model that was not selected returns nothing and costs nothing."""
         return ""
 
-    async def run_prompt(prompt):
+    async def run_prompt(prompt, phrases: dict[str, str]):
         """Every registered model, asked in parallel, keyed by name.
 
         Was a two-element gather naming gemini and chatgpt. A model added to the
         registry was then selected and counted but never actually asked, which
         would have scored it as a silent zero for every prompt.
+
+        Not every model gets the same text. Copilot is asked the search phrase
+        behind the prompt rather than the prompt; see SEPARATE_SCORE.
         """
         answers = await asyncio.gather(*[
-            ASK[m](prompt, request.country) if m in running else _skip()
+            ASK[m](query_for(m, prompt, phrases), request.country)
+            if m in running else _skip()
             for m in ALL_MODELS
         ])
         return prompt, dict(zip(ALL_MODELS, answers))
@@ -2971,16 +3023,32 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         column with a few exact matches in it, and the row says which it got.
         """
         if not KEYWORD_VOLUME_ENABLED:
-            return {}, {}
-        derived = await prompt_keywords(prompts, request.language)
+            return {}
         phrases = sorted({p for ps in derived.values() for p in ps})
         fallback = [p.strip().lower() for p in prompts if p not in derived]
-        return derived, await keyword_volumes(phrases + fallback, request.country)
+        return await keyword_volumes(phrases + fallback, request.country)
+
+    # Deriving the phrases now rather than alongside the answers, because
+    # Copilot is asked one. It is a single call and the answers take minutes,
+    # so the wait is noise; pricing them stays parallel, where the time is.
+    derived: dict[str, list[str]] = {}
+    if KEYWORD_VOLUME_ENABLED or COPILOT_ENABLED:
+        try:
+            derived = await prompt_keywords(prompts, request.language)
+        except Exception as exc:
+            print(f"  keyword derivation failed: {type(exc).__name__}")
+
+    # One phrase per prompt for the models that want a phrase. The first the
+    # model offered: the busiest phrase would be the better choice, but volumes
+    # are not priced yet and waiting for them would serialise the whole audit
+    # behind DataForSEO.
+    search_phrase = {p: (derived.get(p) or [""])[0] for p in prompts}
+    search_phrase = {p: v for p, v in search_phrase.items() if v}
 
     # The volume work does not depend on the answers, so it runs alongside them
     # rather than adding to the wait.
-    prompt_results, (derived, volumes) = await asyncio.gather(
-        asyncio.gather(*[run_prompt(p) for p in prompts]),
+    prompt_results, volumes = await asyncio.gather(
+        asyncio.gather(*[run_prompt(p, search_phrase) for p in prompts]),
         demand(),
     )
 
@@ -3079,6 +3147,11 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
             "prompt": prompt,
             "prompt_type": prompt_type_by_text.get(prompt, "comparison"),
         }
+        # What Copilot was actually typed, when that was not the prompt. On
+        # screen beside its answer, because a result shown under a question it
+        # was not asked is the kind of small lie this whole audit is against.
+        if search_phrase.get(prompt):
+            row["search_query"] = search_phrase[prompt]
         # Absent when there was no phrase to ask about or Google has no data for
         # it. Absent, not zero: zero would claim nobody searches it.
         #
