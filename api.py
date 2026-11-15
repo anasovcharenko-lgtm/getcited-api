@@ -815,6 +815,17 @@ AI_OVERVIEW_ENABLED = (os.getenv("AI_OVERVIEW_ENABLED", "false").lower() == "tru
 COPILOT_ENABLED = (os.getenv("COPILOT_ENABLED", "false").lower() == "true"
                    and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
 
+# Google's conversational search, and a different product from the AI Overview
+# block: its own endpoint, its own answers, its own citations.
+#
+# Scored with the assistants rather than apart from them, because it is asked
+# the same thing they are. AI Mode takes a query of up to 700 characters and is
+# built for questions put as sentences, which is exactly where Bing's summary
+# drew nothing — so the prompt goes in unchanged, and the comparison with
+# ChatGPT and the rest is a comparison of like with like.
+AI_MODE_ENABLED = (os.getenv("AI_MODE_ENABLED", "false").lower() == "true"
+                   and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
+
 # DataForSEO wants a place, not a country code.
 #
 # This table is the FALLBACK. The live list comes from DataForSEO itself (see
@@ -1202,6 +1213,7 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "deepseek": lambda: DEEPSEEK_ENABLED,
     "ai_overview": lambda: AI_OVERVIEW_ENABLED,
     "copilot": lambda: COPILOT_ENABLED,
+    "ai_mode": lambda: AI_MODE_ENABLED,
 }
 ALL_MODELS = list(MODEL_SWITCHES)
 
@@ -1245,6 +1257,7 @@ MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     # results page, not the Copilot app, and a stored run should not let the
     # two be confused later.
     "copilot": lambda: "bing copilot summary via dataforseo",
+    "ai_mode": lambda: "google ai mode via dataforseo",
 }
 
 # How to ask each model. Filled in below as the ask_* functions are defined;
@@ -1954,6 +1967,33 @@ async def ask_copilot(prompt: str, country: str = "") -> str:
         extra={}, prompt=prompt, country=country)
 
 
+async def ask_ai_mode(prompt: str, country: str = "") -> str:
+    """Google's AI Mode answer for this prompt, via DataForSEO.
+
+    A different product from the AI Overview block, with its own endpoint and
+    its own answers: AI Mode is Google's conversational search, and it takes
+    the prompt as written rather than needing it cut down to a search phrase.
+    Up to 700 characters, which every prompt this audit writes fits inside.
+
+    That is why it is scored with the assistants and Copilot is not. The
+    question put to it is the question put to them.
+    """
+    if not AI_MODE_ENABLED:
+        MODEL_ERRORS["ai_mode"] = "disabled"
+        return ""
+    if len(prompt) > 700:
+        # Said out loud rather than truncated. A silently shortened question is
+        # a different question, and the answer would be filed under the one we
+        # meant to ask.
+        MODEL_ERRORS["ai_mode"] = f"prompt is {len(prompt)} chars; the limit is 700"
+        note_failure("ai_mode", "prompt too long")
+        return ""
+    return await _ask_serp_summary(
+        model="ai_mode", label="AI Mode", engine="Google",
+        endpoint="https://api.dataforseo.com/v3/serp/google/ai_mode/live/advanced",
+        extra={}, prompt=prompt, country=country)
+
+
 async def _ask_serp_summary(*, model: str, label: str, engine: str,
                             endpoint: str, extra: dict,
                             prompt: str, country: str) -> str:
@@ -2089,6 +2129,19 @@ def _parse_ai_overview(task: dict) -> tuple[str, list[str], bool]:
                 # would undercount exactly the brands Copilot does name.
                 if str(el.get("url", "")).startswith("http"):
                     urls.append(el["url"])
+
+                # A reference is a source, not the answer.
+                #
+                # Google's AI Mode lists each cited page as an
+                # `ai_overview_reference` whose `text` is a snippet OF THAT
+                # PAGE, not a sentence the model wrote. Folding it into the
+                # answer body would count a brand named on a source page as a
+                # brand the model named — a false "you were mentioned", which
+                # is the worst direction for this product to be wrong in. The
+                # url is taken above; the prose is not.
+                if str(el.get("type", "")).endswith("_reference"):
+                    continue
+
                 # `snippet` is Bing's; `title` carries meaning there too, since
                 # a Copilot element is a titled extract rather than a run of
                 # prose. Both are kept because a brand is as likely to be named
@@ -2197,6 +2250,7 @@ ASK.update({
     "deepseek": lambda prompt, country: ask_deepseek(prompt, country=country),
     "ai_overview": lambda prompt, country: ask_ai_overview(prompt, country=country),
     "copilot": lambda prompt, country: ask_copilot(prompt, country=country),
+    "ai_mode": lambda prompt, country: ask_ai_mode(prompt, country=country),
 })
 assert set(ASK) == set(ALL_MODELS), (
     f"registry and ASK disagree: {set(ALL_MODELS) ^ set(ASK)}")
@@ -4307,7 +4361,7 @@ def check_indexable(facts: _PageFacts, url: str) -> dict | None:
 # and saying nothing beats implying one.
 CRAWLER_OPERATOR_MODELS = {
     "OpenAI": ["chatgpt"],
-    "Google": ["gemini", "ai_overview"],
+    "Google": ["gemini", "ai_overview", "ai_mode"],
     "Perplexity": ["perplexity"],
     # bingbot is what grounds the Copilot summary, so blocking it is what costs
     # visibility there — msnbot is the same crawler's older name.
@@ -4318,6 +4372,7 @@ MODEL_LABELS = {
     "chatgpt": "ChatGPT", "gemini": "Gemini", "perplexity": "Perplexity",
     "deepseek": "DeepSeek", "ai_overview": "Google AI Overview",
     "copilot": "Copilot",
+    "ai_mode": "Google AI Mode",
 }
 
 
