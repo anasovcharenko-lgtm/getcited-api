@@ -429,6 +429,45 @@ def _strip_separators(text: str) -> tuple[str, list[int]]:
     return "".join(out), index_map
 
 
+def _brand_tokens(name: str) -> list[str]:
+    """A brand name as lowercase word tokens, punctuation dropped."""
+    return [t for t in re.split(r"[^0-9a-z]+", (name or "").lower()) if t]
+
+
+def same_brand(a: str, b: str) -> bool:
+    """Are these two names the same brand written differently?
+
+    Models do not quote a brand the way a form does. An audit of Battle Start
+    came back having "discovered" BATTLE START Arena as a company nobody had
+    asked about, so the brand ran against itself: its own row in share of
+    voice, and — worse — prompts where it was the only name mentioned filed
+    under "someone was named and it was not you". Visibility it had earned,
+    scored as a loss.
+
+    Two rules, and no more. Identical once separators go, which is what
+    `brand_in_text` already relies on, so "SetLoyalty" and "Set-Loyalty" are
+    one brand. Or one name's words open the other's: "Battle Start" against
+    "BATTLE START Arena".
+
+    The second rule needs at least two words. A single word swallows too much:
+    this same run discovered "Meta Quest 3S 256GB", and a client tracking
+    "Meta" should get the company, not a headset SKU. Trading a missed merge
+    for a wrong one is the right way round — a brand listed twice is visible
+    and fixable, a brand merged into a product is neither.
+    """
+    if not a or not b:
+        return False
+    if _strip_separators(a)[0] == _strip_separators(b)[0]:
+        return True
+    ta, tb = _brand_tokens(a), _brand_tokens(b)
+    if not ta or not tb:
+        return False
+    short, long = sorted((ta, tb), key=len)
+    if len(short) < 2:
+        return False
+    return long[:len(short)] == short
+
+
 def brand_in_text(text: str, name: str) -> bool:
     """Does this brand appear in this text, however either side spells it?
 
@@ -2508,17 +2547,22 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
         print(f"  brand discovery failed: {type(exc).__name__}")
         return []
 
-    known_flat = {_strip_separators(k)[0] for k in known if k}
-    found, seen = [], set()
+    tracked = [k for k in known if k]
+    found: list[str] = []
     for line in (raw or "").split("\n"):
         name = line.strip().lstrip("-*0123456789. ").strip()
         if not name or name.upper() == "NONE" or len(name) > 40:
             continue
-        flat = _strip_separators(name)[0]
-        # Already tracked, or already found under a different spelling.
-        if not flat or flat in known_flat or flat in seen:
+        if not _strip_separators(name)[0]:
             continue
-        seen.add(flat)
+        # Already tracked, or already found under a different spelling.
+        # Compared with same_brand rather than by exact flattened string: the
+        # old test let "BATTLE START Arena" through as a brand nobody had
+        # asked about, in an audit of Battle Start.
+        if any(same_brand(name, k) for k in tracked):
+            continue
+        if any(same_brand(name, f) for f in found):
+            continue
         found.append(name)
     return found[:12]
 
@@ -2559,10 +2603,13 @@ def share_of_voice(results: list[dict], counted: list[str], clean_brand: str,
     for r in results:
         for m in counted:
             for name in (r.get(m, {}).get("discovered_brands") or []):
-                if name not in counts:
+                # Not `name not in counts`: a stored run can carry a discovered
+                # name that is this brand under another spelling, and admitting
+                # it here would give the brand a second row to compete with.
+                if not any(same_brand(name, k) for k in counts):
                     counts[name] = 0
     for name in list(counts):
-        if name == clean_brand or name in competitors:
+        if same_brand(name, clean_brand) or any(same_brand(name, c) for c in competitors):
             continue
         counts[name] = sum(1 for r in results for m in counted
                            if name in (r.get(m, {}).get("discovered_brands") or []))
