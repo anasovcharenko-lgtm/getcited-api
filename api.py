@@ -724,9 +724,18 @@ DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
 AI_OVERVIEW_ENABLED = (os.getenv("AI_OVERVIEW_ENABLED", "false").lower() == "true"
                        and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
 
-# DataForSEO wants a place, not a country code. Overridable in one env var
-# rather than needing a code change for a market we have not listed.
-DATAFORSEO_LOCATIONS = {
+# DataForSEO wants a place, not a country code.
+#
+# This table is the FALLBACK. The live list comes from DataForSEO itself (see
+# `load_markets` below), because a hand-written one drifts and drifted: Japan
+# and Ukraine were offered in the interface and missing here, so choosing them
+# fell through to the United States and the report called the result Japan.
+# Three copies of this list existed — two in the frontend, one here — and
+# keeping them in step was somebody's job rather than a property of the code.
+#
+# What stays hand-written is only what the vendor cannot tell us: which markets
+# to show first. The rest is whatever Google actually supports.
+_FALLBACK_LOCATIONS = {
     "US": "United States", "GB": "United Kingdom", "UK": "United Kingdom",
     "RU": "Russia", "TR": "Turkey", "DE": "Germany", "FR": "France",
     "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "PL": "Poland",
@@ -738,7 +747,14 @@ DATAFORSEO_LOCATIONS = {
     # them Chile. Plausible numbers for the wrong market are worse than none.
     "CL": "Chile", "MX": "Mexico", "AR": "Argentina",
     "CO": "Colombia", "PE": "Peru",
+    # Offered in the interface and absent here until now, which is how an audit
+    # of Japan came back describing the United States.
+    "JP": "Japan", "UA": "Ukraine",
 }
+# What `dataforseo_market` reads. Starts as the fallback and is replaced by the
+# vendor's own list once that has been fetched, so a market resolves correctly
+# even on the first request after a cold start.
+DATAFORSEO_LOCATIONS = dict(_FALLBACK_LOCATIONS)
 DATAFORSEO_DEFAULT_LOCATION = os.getenv("DATAFORSEO_LOCATION", "United States")
 
 # The SERP endpoint requires a language; the keyword-volume endpoint must not be
@@ -748,13 +764,164 @@ DATAFORSEO_DEFAULT_LOCATION = os.getenv("DATAFORSEO_LOCATION", "United States")
 # Derived from the market rather than from the audit's interface language: a
 # search in Germany is answered in German whichever language the dashboard is
 # in, and the overview we are measuring is the one a German buyer sees.
+# A default, not a constraint: the audit form lets the market and the language
+# be chosen separately, because a brand selling into Spain may be courting
+# English-speaking buyers there. This only decides which language is proposed
+# when a market is picked. Unlisted countries get English, which is a guess and
+# says so rather than pretending the list is complete.
 DATAFORSEO_LANGUAGES = {
     "US": "en", "GB": "en", "UK": "en", "CA": "en", "AU": "en", "IN": "en",
-    "RU": "ru", "KZ": "ru", "TR": "tr", "DE": "de", "FR": "fr", "ES": "es",
-    "IT": "it", "NL": "nl", "PL": "pl", "BR": "pt", "AE": "en",
+    "IE": "en", "NZ": "en", "ZA": "en", "SG": "en", "PH": "en", "NG": "en",
+    "RU": "ru", "KZ": "ru", "BY": "ru", "UA": "uk",
+    "TR": "tr", "DE": "de", "AT": "de", "CH": "de",
+    "FR": "fr", "BE": "fr", "ES": "es", "IT": "it", "NL": "nl", "PL": "pl",
+    "PT": "pt", "BR": "pt", "AE": "en", "SA": "ar", "EG": "ar", "IL": "he",
     "CL": "es", "MX": "es", "AR": "es", "CO": "es", "PE": "es",
+    "EC": "es", "UY": "es", "VE": "es", "CR": "es", "GT": "es",
+    "JP": "ja", "KR": "ko", "CN": "zh-CN", "TW": "zh-TW", "HK": "zh-TW",
+    "TH": "th", "VN": "vi", "ID": "id", "MY": "ms",
+    "SE": "sv", "NO": "no", "DK": "da", "FI": "fi", "IS": "is",
+    "CZ": "cs", "SK": "sk", "HU": "hu", "RO": "ro", "BG": "bg",
+    "GR": "el", "HR": "hr", "RS": "sr", "SI": "sl", "LT": "lt",
+    "LV": "lv", "EE": "et", "PK": "en", "BD": "bn", "LK": "en",
 }
 DATAFORSEO_DEFAULT_LANGUAGE = os.getenv("DATAFORSEO_LANGUAGE", "en")
+
+# Which markets sit at the top of the list. The vendor returns its countries
+# alphabetically, which puts Afghanistan first and the markets anyone actually
+# audits three screens down.
+MARKETS_PINNED = ["US", "GB", "DE", "FR", "ES", "IT", "NL", "PL",
+                  "CA", "AU", "IN", "BR", "MX", "AE", "TR"]
+
+# One day. The list changes when a vendor gains or drops a country — rarely,
+# but it does happen, and a cached copy from last week is the difference
+# between a market quietly failing and a market quietly lying.
+MARKETS_TTL = int(os.getenv("MARKETS_TTL", str(24 * 3600)))
+MARKETS_CACHE_FILE = os.getenv("MARKETS_CACHE_FILE", "/tmp/getcited-markets.json")
+
+_markets_loaded_at = 0.0
+_markets_source = "fallback"
+_markets_lock = asyncio.Lock()
+
+
+def _apply_markets(by_code: dict[str, str], source: str) -> None:
+    """Swap in a market table, keeping the aliases the rest of the code uses."""
+    global DATAFORSEO_LOCATIONS, _markets_source
+    merged = dict(by_code)
+    if "GB" in merged:
+        merged.setdefault("UK", merged["GB"])
+    if source == "fallback":
+        for code, name in _FALLBACK_LOCATIONS.items():
+            merged.setdefault(code, name)
+    # A live list REPLACES the built-in one rather than being added to it. The
+    # built-in list is what we are trying to stop trusting: merging the two
+    # would keep offering a market the vendor has dropped, which is the fault
+    # being fixed, wearing a newer coat. Truncation is guarded by the size
+    # check in the caller, not by holding on to stale names here.
+    DATAFORSEO_LOCATIONS = merged
+    _markets_source = source
+
+
+async def load_markets(force: bool = False) -> dict[str, str]:
+    """The countries Google SERP supports, from DataForSEO rather than memory.
+
+    Lazy and cached. Not done at import: a cold start should not wait on a
+    vendor, and an endpoint that cannot answer until a 30MB list arrives is a
+    worse failure than a list that is a day old.
+
+    The endpoint is free — DataForSEO bills nothing for its location
+    dictionaries — so refreshing it costs time, not money.
+    """
+    global _markets_loaded_at
+    if not force and time.time() - _markets_loaded_at < MARKETS_TTL:
+        return DATAFORSEO_LOCATIONS
+
+    async with _markets_lock:
+        # Re-checked inside the lock: ten audits starting together should cost
+        # one fetch, not ten.
+        if not force and time.time() - _markets_loaded_at < MARKETS_TTL:
+            return DATAFORSEO_LOCATIONS
+
+        if not (DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD):
+            _markets_loaded_at = time.time()
+            return DATAFORSEO_LOCATIONS
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.get(
+                    "https://api.dataforseo.com/v3/serp/google/locations",
+                    auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+                )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+            rows = (resp.json().get("tasks") or [{}])[0].get("result") or []
+            by_code = {
+                str(r["country_iso_code"]).upper(): r["location_name"]
+                for r in rows
+                if r.get("location_type") == "Country"
+                and r.get("country_iso_code") and r.get("location_name")
+            }
+            if len(by_code) < 50:
+                raise RuntimeError(f"only {len(by_code)} countries returned")
+            _apply_markets(by_code, "dataforseo")
+            _markets_loaded_at = time.time()
+            try:
+                with open(MARKETS_CACHE_FILE, "w") as fh:
+                    json.dump(by_code, fh)
+            except Exception as exc:
+                print(f"markets cache write failed: {exc}")
+            missing = sorted(set(_FALLBACK_LOCATIONS) - set(by_code) - {"UK"})
+            print(f"markets: {len(by_code)} countries from DataForSEO"
+                  + (f"; not offered by the vendor: {', '.join(missing)}" if missing else ""))
+            return DATAFORSEO_LOCATIONS
+        except Exception as exc:
+            print(f"markets: live fetch failed ({exc})")
+
+        try:
+            with open(MARKETS_CACHE_FILE) as fh:
+                cached = json.load(fh)
+            if isinstance(cached, dict) and len(cached) >= 50:
+                _apply_markets(cached, "cache")
+                _markets_loaded_at = time.time()
+                print(f"markets: {len(cached)} countries from the cached copy")
+                return DATAFORSEO_LOCATIONS
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"markets cache read failed: {exc}")
+
+        # Retry in ten minutes rather than tomorrow: whatever we are serving
+        # right now is not the list we want to be serving.
+        _markets_loaded_at = time.time() - MARKETS_TTL + 600
+        # Says which of the two actually happened. An earlier version printed
+        # "falling back to the built-in markets" on both paths, including the
+        # one where a perfectly good list from this morning was still loaded
+        # and still being used — a log line describing a different program.
+        if _markets_source == "fallback":
+            print(f"markets: no vendor and no cached copy; using the "
+                  f"{len(_FALLBACK_LOCATIONS)} built-in markets")
+        else:
+            print(f"markets: refresh failed; keeping the "
+                  f"{len(DATAFORSEO_LOCATIONS)} markets already loaded "
+                  f"from the {_markets_source}")
+        return DATAFORSEO_LOCATIONS
+
+
+def markets_payload() -> dict:
+    """What the interface builds its dropdown from."""
+    order = {code: i for i, code in enumerate(MARKETS_PINNED)}
+    codes = [c for c in DATAFORSEO_LOCATIONS if c != "UK"]
+    codes.sort(key=lambda c: (order.get(c, len(order)), DATAFORSEO_LOCATIONS[c]))
+    return {
+        "source": _markets_source,
+        "pinned": [c for c in MARKETS_PINNED if c in DATAFORSEO_LOCATIONS],
+        "markets": [
+            {"code": c,
+             "name": DATAFORSEO_LOCATIONS[c],
+             "language": DATAFORSEO_LANGUAGES.get(c, DATAFORSEO_DEFAULT_LANGUAGE)}
+            for c in codes
+        ],
+    }
 
 _MARKETS_WARNED: set[str] = set()
 
@@ -2410,6 +2577,10 @@ def aggregate_audit(results: list[dict], running: list[str], brand: str,
 
 @app.post("/audit")
 async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_quota)):
+    # Before anything resolves a country to a place. Cached, so this is free
+    # on every run but the first of the day; skipping it would let a cold
+    # start answer the first audit of the morning from the built-in table.
+    await load_markets()
     brand = request.brand
     # Both shapes collapse to: a list of names, plus domains where we know them.
     if request.competitor_list:
@@ -3928,22 +4099,23 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
         return {}
 
 
-@app.get("/markets", dependencies=[Depends(admin_only)])
-def markets():
-    """The markets keyword data can be asked for.
+@app.get("/markets")
+async def markets():
+    """The markets an audit can be run in.
 
     Served rather than hardcoded in the dashboard so there is one list. Every
     other model list in this codebase was duplicated into the frontend at some
-    point, and every one of them drifted.
+    point, and every one of them drifted — this one included: it was written
+    here for the keyword page, gated to admins, and the audit form went on
+    carrying its own copy. Two of the countries in that copy had no entry on
+    this side at all, so picking them quietly produced United States results.
+
+    Public, and deliberately. It is a list of country names, it is what the
+    signed-out landing page builds its dropdown from, and an audit form that
+    cannot name its markets until someone signs in is worse than useless.
     """
-    return {"markets": sorted(
-        ({"code": code,
-          "name": name,
-          "language": DATAFORSEO_LANGUAGES.get(code, DATAFORSEO_DEFAULT_LANGUAGE)}
-         for code, name in DATAFORSEO_LOCATIONS.items()
-         # UK and GB are the same place under two codes; keep the ISO one.
-         if code != "UK"),
-        key=lambda m: m["name"])}
+    await load_markets()
+    return markets_payload()
 
 
 @app.post("/keyword-research", dependencies=[Depends(admin_only)])
