@@ -4496,6 +4496,29 @@ async def keyword_difficulty(keywords: list[str], country: str = "") -> dict:
         return {}
 
 
+@app.get("/models")
+def models():
+    """The models an audit can run right now.
+
+    Served, for the same reason `/markets` is: the server owns the switches,
+    and anything the browser hardcodes about them goes stale. It went stale
+    immediately — an audit run before a model existed has no trace of it in
+    `model_status`, so the dashboard had no way to learn that a new model was
+    available and could be added to that audit without running it again.
+
+    Public. It is a list of model names, and the signed-out landing page
+    offers the same choice.
+    """
+    return {"models": [
+        {"key": m,
+         "label": MODEL_LABELS.get(m, m),
+         # Measured, but scored on its own; see SEPARATE_SCORE. The interface
+         # needs to know, or it will offer to add a model to a headline the
+         # model will never appear in.
+         "separate": m in SEPARATE_SCORE}
+        for m in available_models()]}
+
+
 @app.get("/markets")
 async def markets():
     """The markets an audit can be run in.
