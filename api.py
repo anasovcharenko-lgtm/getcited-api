@@ -337,6 +337,33 @@ def is_search_page(url: str) -> bool:
     return u.path.rstrip("/") in ("", "/search", "/webhp", "/images", "/imghp")
 
 
+# Furniture from the results block, cited as though it were reading.
+#
+# An AI Overview carries thumbnails, map pins and the viewer Google opens its
+# own panels in. They arrive in the same list as the articles, and an audit
+# that counts them says the model "read" a 192-pixel JPEG and a driving
+# direction. Nobody can write for them, nobody can be mentioned on them, and a
+# link-building list containing them is a list the reader stops trusting.
+_NOT_A_PAGE = (
+    "googleusercontent.com",        # thumbnails served with the overview
+    "gstatic.com",
+    "ggpht.com",
+)
+_NOT_A_PAGE_PATHS = ("/maps", "/searchviewer", "/imgres", "/travel", "/shopping")
+
+
+def is_not_a_page(url: str) -> bool:
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    host = u.netloc.lower().replace("www.", "")
+    if any(host.endswith(h) for h in _NOT_A_PAGE):
+        return True
+    return (host.endswith("google.com")
+            and any(u.path.startswith(p) for p in _NOT_A_PAGE_PATHS))
+
+
 def is_redirect_url(url: str) -> bool:
     """A wrapper Google hands out in place of the page it points at.
 
@@ -376,10 +403,21 @@ def clean_source_url(url: str) -> str:
 async def resolve_redirects(urls: set[str]) -> dict[str, str]:
     """Follow the wrappers once each, and return what they point at.
 
-    A HEAD, because the body is not wanted here — the page itself is read
-    later, by the source check, and only for the handful the user asks about.
+    A HEAD first, because the body is not wanted here — the page itself is
+    read later, by the source check, and only for the handful the user asks
+    about.
+
+    Then a GET for whatever HEAD could not place. Google answers HEAD on
+    `/goto` with a 200 and no redirect, so a HEAD-only pass left most of them
+    unresolved: one audit kept forty-six, and an answer's source list read
+    "google.com/goto" twelve times over. The blob after `url=` cannot be
+    decoded instead — it is field 2 of a protobuf whose bytes are encrypted
+    behind the same `01c42245d7` header every time, with no plaintext in it.
+    Following the link is the only way to learn where it goes.
+
     A wrapper that will not resolve keeps its own URL rather than being
-    dropped: a citation we cannot name is still a citation.
+    dropped: a citation we cannot name is still a citation, and the interface
+    counts it without pretending to name it.
     """
     targets = [u for u in urls if is_redirect_url(u)]
     if not targets:
@@ -389,13 +427,15 @@ async def resolve_redirects(urls: set[str]) -> dict[str, str]:
 
     async def one(client, url: str) -> None:
         async with sem:
-            try:
-                r = await client.head(url, follow_redirects=True, timeout=10)
-                final = str(r.url)
-                if final and not is_redirect_url(final):
-                    out[url] = final
-            except Exception:
-                pass
+            for fetch in (client.head, client.get):
+                try:
+                    r = await fetch(url, follow_redirects=True, timeout=10)
+                    final = str(r.url)
+                    if final and not is_redirect_url(final):
+                        out[url] = final
+                        return
+                except Exception:
+                    continue
 
     async with httpx.AsyncClient(headers={"User-Agent": SOURCE_BROWSER_UA}) as client:
         await asyncio.gather(*[one(client, u) for u in targets])
@@ -3130,7 +3170,8 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         # domain at all, and the answer would be filed as naming them without
         # linking to them — a wrong verdict from a URL nobody could read.
         urls = [clean_source_url(redirect_map.get(u, u)) for u in extract_urls(answer)]
-        urls = [u for u in urls if u and not is_search_page(u)]
+        urls = [u for u in urls
+                if u and not is_search_page(u) and not is_not_a_page(u)]
 
         has_own_link = any(url_matches_name(u, brand_domain, clean_brand) for u in urls)
 
