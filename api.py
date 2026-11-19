@@ -514,6 +514,62 @@ def same_brand(a: str, b: str) -> bool:
     return long[:len(short)] == short
 
 
+def extends_brand(longer: str, shorter: str) -> bool:
+    """Is `longer` the same name as `shorter` with a qualifier on the end?
+
+    The gap `same_brand` leaves open on purpose. That one must decide between
+    two names with only the names in hand, so it refuses to let a single word
+    swallow anything — otherwise a client tracking "Meta" would be handed a
+    headset SKU as their own visibility.
+
+    This one is for the case where we already know the shorter name is in play:
+    the models used it themselves, or the client tracks it. "ANVIO" and "ANVIO
+    VR" both came back from one run and took a row each, splitting the share of
+    one business in half; so did "WARPOINT" and "WARPOINT Subscription". When
+    the shorter form is already there, the longer one is a qualifier on it far
+    more often than it is a second business, and the caller must only ever
+    collapse towards the shorter — `brand_in_text("ANVIO")` matches every
+    answer "ANVIO VR" matched and some it did not, so nothing is lost by
+    keeping the short one and everything is lost by keeping the long one.
+
+    Two extra words at most. "Amazon" standing next to "Amazon Elastic Compute
+    Cloud" is a different claim from "ANVIO" next to "ANVIO VR".
+
+    What this still gets wrong: a parent company named alongside its product,
+    "Apple" and "Apple Music" in a streaming audit. The count stays right — the
+    two were one business all along — but the row reads "Apple" where the
+    market says "Apple Music". A label that is too general beats a share split
+    across two rows, which is wrong in a way nobody can see.
+    """
+    tl, ts = _brand_tokens(longer), _brand_tokens(shorter)
+    if not tl or not ts or len(tl) <= len(ts):
+        return False
+    if tl[:len(ts)] != ts:
+        return False
+    return len(tl) - len(ts) <= 2
+
+
+def collapse_variants(names: list[str], present: list[str]) -> list[str]:
+    """Drop names that are a qualifier on a name already in play.
+
+    `present` is what we know is real before looking: the audited brand and the
+    competitors the client tracks. Names are then considered shortest first, so
+    a list arriving as ["ANVIO VR", "ANVIO"] collapses the same way as one
+    arriving the other way round — the model's output order is not evidence
+    about which form is the business.
+    """
+    kept: list[str] = []
+    anchors = [p for p in present if p]
+    for name in sorted(names, key=lambda n: (len(_brand_tokens(n)), len(n))):
+        if any(extends_brand(name, a) for a in anchors + kept):
+            continue
+        kept.append(name)
+    # Back into the order they came in, so the caller's list looks untouched
+    # apart from what left it.
+    order = {n: i for i, n in enumerate(names)}
+    return sorted(kept, key=lambda n: order[n])
+
+
 def brand_in_text(text: str, name: str) -> bool:
     """Does this brand appear in this text, however either side spells it?
 
@@ -2781,13 +2837,23 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
     if not blob.strip():
         return []
 
+    # "Names recommended or compared" was too wide a net. An audit of VR
+    # entertainment venues came back with Meta Quest 3 ranked second among the
+    # brands taking the client's visibility — a headset the venues buy, not a
+    # venue competing with them. The question a buyer is actually choosing
+    # between is the one worth asking.
     prompt = (
-        f"Below are AI answers about: {category}.\n\n"
-        "List the product, tool or company names that are recommended or compared "
-        "in them. One per line, nothing else.\n"
+        f"Below are AI answers to someone asking about: {category}.\n\n"
+        "List the named businesses or products a buyer would be choosing "
+        "between here. One per line, nothing else.\n"
         "Rules:\n"
-        "- Real product names only. Not generic terms like 'CRM' or 'loyalty program'.\n"
-        "- Write each name exactly as it appears in the text.\n"
+        "- Only names that are themselves an answer to that question. Leave out "
+        "equipment, platforms and suppliers that the answer mentions as things "
+        "those businesses use or sell rather than compete with.\n"
+        "- Real names only. Not generic terms like 'CRM' or 'loyalty program'.\n"
+        "- Write each name as it appears in the text.\n"
+        "- If one of them appears under several names, give the shortest form "
+        "that appears in the text.\n"
         "- If there are none, reply NONE.\n\n"
         f"Answers:\n{blob}"
     )
@@ -2814,6 +2880,12 @@ async def discover_brands(results: list[dict], known: list[str], category: str) 
         if any(same_brand(name, f) for f in found):
             continue
         found.append(name)
+    # The prompt asks for one form per business, but a model asked twice does
+    # not answer twice the same, and a run that split ANVIO from ANVIO VR had
+    # halved one business's share without anything on screen to show it. Done
+    # after the loop rather than inside it because the shorter form can arrive
+    # second.
+    found = collapse_variants(found, tracked)
     return found[:12]
 
 
@@ -2850,19 +2922,33 @@ def share_of_voice(results: list[dict], counted: list[str], clean_brand: str,
     # Whatever the models brought up unprompted. Absent on a run stored before
     # discovery existed, which simply leaves those brands out rather than
     # breaking the sum.
+    seen: list[str] = []
     for r in results:
         for m in counted:
             for name in (r.get(m, {}).get("discovered_brands") or []):
                 # Not `name not in counts`: a stored run can carry a discovered
                 # name that is this brand under another spelling, and admitting
                 # it here would give the brand a second row to compete with.
-                if not any(same_brand(name, k) for k in counts):
-                    counts[name] = 0
+                if not any(same_brand(name, k) for k in counts) and name not in seen:
+                    seen.append(name)
+
+    # Runs stored before discovery collapsed variants still hold both forms, so
+    # the split has to be undone here too rather than only at discovery — the
+    # chart reads the stored rows, and an old audit reopened is the one place a
+    # halved share would still be on screen.
+    for name in collapse_variants(seen, [clean_brand] + list(competitors)):
+        counts[name] = 0
+
     for name in list(counts):
         if same_brand(name, clean_brand) or any(same_brand(name, c) for c in competitors):
             continue
-        counts[name] = sum(1 for r in results for m in counted
-                           if name in (r.get(m, {}).get("discovered_brands") or []))
+        # A row that absorbed "ANVIO VR" has to count the answers that named it
+        # that way, or collapsing the two would have thrown the mentions away
+        # instead of adding them up.
+        counts[name] = sum(
+            1 for r in results for m in counted
+            if any(d == name or extends_brand(d, name)
+                   for d in (r.get(m, {}).get("discovered_brands") or [])))
 
     total = sum(counts.values())
     rows = [{"name": n,
