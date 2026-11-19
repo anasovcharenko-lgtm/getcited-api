@@ -348,6 +348,12 @@ _NOT_A_PAGE = (
     "googleusercontent.com",        # thumbnails served with the overview
     "gstatic.com",
     "ggpht.com",
+    # The same thing on Yandex's side: its image CDN and its static assets.
+    # Found by a test rather than by a customer, which is the only reason this
+    # line reads as foresight.
+    "avatars.mds.yandex.net",
+    "yastatic.net",
+    "mc.yandex.ru",                 # the counter, not a document
 )
 _NOT_A_PAGE_PATHS = ("/maps", "/searchviewer", "/imgres", "/travel", "/shopping")
 
@@ -741,6 +747,14 @@ MODEL_ERRORS: dict[str, str] = {}
 # cleared by good news.
 MODEL_FAILURES: dict[str, dict[str, int]] = {}
 
+# The sub-questions Yandex rewrote each prompt into, keyed by prompt.
+#
+# Query fan-out, which every engine does and only this one reports back. It is
+# the list of questions a page actually has to answer in order to be found,
+# which is worth more to a customer than most of what this audit measures, and
+# it arrives free alongside the answer.
+YANDEX_QUERIES: dict[str, list[str]] = {}
+
 
 def note_failure(model: str, reason: str) -> None:
     MODEL_FAILURES.setdefault(model, {})
@@ -865,6 +879,33 @@ COPILOT_ENABLED = (os.getenv("COPILOT_ENABLED", "false").lower() == "true"
 # ChatGPT and the rest is a comparison of like with like.
 AI_MODE_ENABLED = (os.getenv("AI_MODE_ENABLED", "false").lower() == "true"
                    and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
+
+# Yandex's generative answer — the one shown above the results on yandex.ru,
+# and the single most-used AI surface in Russia by a wide margin.
+#
+# Reached through Yandex Cloud's Search API rather than by parsing a page.
+# Every other route was a dead end: the organic Search API returns no
+# generated text, DataForSEO removed Russia, Belarus and Yandex entirely, and
+# the model Yandex published on Hugging Face is the base, not the one that
+# answers in search. This endpoint is the vendor's own, and it returns the
+# answer with the documents behind it.
+#
+# Slow. The published experience is answers taking up to two minutes, against
+# the ninety seconds every other model here is given.
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "")
+YANDEX_TIMEOUT = int(os.getenv("YANDEX_TIMEOUT", "200"))
+YANDEX_ENABLED = (os.getenv("YANDEX_ENABLED", "false").lower() == "true"
+                  and bool(YANDEX_API_KEY) and bool(YANDEX_FOLDER_ID))
+
+# Which Yandex a question is asked of. The endpoint takes a search domain, not
+# a country, and the two only partly line up: everything outside the countries
+# Yandex runs a domain for goes to yandex.com, which is a real answer about a
+# real market rather than a silent substitution of a different one.
+YANDEX_SEARCH_TYPES = {
+    "RU": "SEARCH_TYPE_RU", "TR": "SEARCH_TYPE_TR", "KZ": "SEARCH_TYPE_KK",
+    "BY": "SEARCH_TYPE_BE", "UZ": "SEARCH_TYPE_UZ",
+}
 
 # DataForSEO wants a place, not a country code.
 #
@@ -1254,6 +1295,7 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "ai_overview": lambda: AI_OVERVIEW_ENABLED,
     "copilot": lambda: COPILOT_ENABLED,
     "ai_mode": lambda: AI_MODE_ENABLED,
+    "yandex": lambda: YANDEX_ENABLED,
 }
 ALL_MODELS = list(MODEL_SWITCHES)
 
@@ -1298,6 +1340,7 @@ MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     # two be confused later.
     "copilot": lambda: "bing copilot summary via dataforseo",
     "ai_mode": lambda: "google ai mode via dataforseo",
+    "yandex": lambda: "yandex generative search via yandex cloud",
 }
 
 # How to ask each model. Filled in below as the ask_* functions are defined;
@@ -2034,6 +2077,94 @@ async def ask_ai_mode(prompt: str, country: str = "") -> str:
         extra={}, prompt=prompt, country=country)
 
 
+async def ask_yandex(prompt: str, country: str = "") -> str:
+    """Yandex's generative answer for this prompt, from Yandex Cloud.
+
+    The prompt goes in as written — the endpoint takes chat messages, not a
+    search phrase, so this is asked the same question the assistants are and
+    is scored beside them.
+
+    Two things arrive here that no other surface in this audit provides.
+
+    Each source carries a `used` flag: Yandex says which of the documents it
+    read actually went into the answer. Everywhere else, "cited" and "used"
+    are the same word and the difference is unmeasurable — the distinction a
+    paper published this month found fails for up to one claim in seven. Here
+    the vendor simply tells us, so the answer carries only the documents it
+    says it used, and the rest are counted as read.
+
+    And `searchQueries` returns the queries the model rewrote the prompt into.
+    That is query fan-out, visible: the sub-questions a page actually has to
+    answer to be found. It is stored on the row for the interface to show.
+
+    What this is not: a guarantee of what a person sees on yandex.ru. Yandex
+    documents no equivalence between this endpoint and the live results page,
+    and nobody should claim one. It is the same engine answering the same
+    question through the door Yandex opened.
+    """
+    if not YANDEX_ENABLED:
+        MODEL_ERRORS["yandex"] = "disabled"
+        return ""
+    search_type = YANDEX_SEARCH_TYPES.get((country or "").upper(), "SEARCH_TYPE_COM")
+    try:
+        async with httpx.AsyncClient(timeout=YANDEX_TIMEOUT) as client:
+            resp = await client.post(
+                "https://searchapi.api.cloud.yandex.net/v2/gen/search",
+                headers={"Authorization": f"Api-Key {YANDEX_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"messages": [{"content": prompt[:16384], "role": "ROLE_USER"}],
+                      "folderId": YANDEX_FOLDER_ID,
+                      "searchType": search_type,
+                      "fixMisspell": True},
+            )
+        if resp.status_code >= 400:
+            note = f"{resp.status_code}: {resp.text[:200]}"
+            print(f"Yandex {note}")
+            MODEL_ERRORS["yandex"] = note
+            note_failure("yandex", f"HTTP {resp.status_code}")
+            return ""
+        data = resp.json()
+
+        # A refusal is not an absence of an answer and not an absence of the
+        # brand. Recorded as what it is, so it cannot be read as "nobody was
+        # named here".
+        if data.get("isAnswerRejected"):
+            MODEL_ERRORS["yandex"] = "the model declined to answer this prompt"
+            note_failure("yandex", "answer rejected")
+            print(f"Yandex declined: {prompt[:60]!r}")
+            return ""
+
+        text = ((data.get("message") or {}).get("content") or "").strip()
+        sources = [s for s in (data.get("sources") or []) if isinstance(s, dict)]
+        # `used` is absent on older responses; treat a missing flag as used,
+        # since dropping a real citation is the costlier mistake.
+        used = [s for s in sources if s.get("used", True)]
+        urls = [clean_source_url(s["url"]) for s in used
+                if str(s.get("url", "")).startswith("http")]
+        urls = [u for u in urls if u and not is_search_page(u) and not is_not_a_page(u)]
+
+        queries = [q.get("text", "") for q in (data.get("searchQueries") or [])
+                   if isinstance(q, dict) and q.get("text")]
+        if queries:
+            YANDEX_QUERIES[prompt] = queries
+
+        MODEL_ERRORS.pop("yandex", None)
+        if not text:
+            MODEL_ABSENT.setdefault("yandex", set()).add(prompt)
+            print(f"Yandex: no generated answer for {prompt[:60]!r}")
+            return ""
+        if urls:
+            text += "\n\nSources: " + " ".join(dict.fromkeys(urls))
+        print(f"Yandex OK: {len(text)} chars, {len(urls)} used of "
+              f"{len(sources)} read, {len(queries)} sub-queries")
+        return text
+    except Exception as e:
+        print(f"Yandex error: {e}")
+        MODEL_ERRORS["yandex"] = str(e)[:300]
+        note_failure("yandex", type(e).__name__)
+        return ""
+
+
 async def _ask_serp_summary(*, model: str, label: str, engine: str,
                             endpoint: str, extra: dict,
                             prompt: str, country: str) -> str:
@@ -2291,6 +2422,7 @@ ASK.update({
     "ai_overview": lambda prompt, country: ask_ai_overview(prompt, country=country),
     "copilot": lambda prompt, country: ask_copilot(prompt, country=country),
     "ai_mode": lambda prompt, country: ask_ai_mode(prompt, country=country),
+    "yandex": lambda prompt, country: ask_yandex(prompt, country=country),
 })
 assert set(ASK) == set(ALL_MODELS), (
     f"registry and ASK disagree: {set(ALL_MODELS) ^ set(ASK)}")
@@ -3032,6 +3164,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     MODEL_ERRORS.clear()
     MODEL_ABSENT.clear()
     MODEL_FAILURES.clear()
+    YANDEX_QUERIES.clear()
 
     brand_info = await enrich_brand(brand, description, website)
     # An undetermined category should not silently become "<brand> category":
@@ -3247,6 +3380,12 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
         # was not asked is the kind of small lie this whole audit is against.
         if search_phrase.get(prompt):
             row["search_query"] = search_phrase[prompt]
+        # The sub-questions Yandex broke this prompt into. Kept on the row
+        # rather than aggregated away: they are specific to the question, and
+        # a list of sub-questions detached from the question it came from is
+        # just a word cloud.
+        if YANDEX_QUERIES.get(prompt):
+            row["sub_queries"] = YANDEX_QUERIES[prompt]
         # Absent when there was no phrase to ask about or Google has no data for
         # it. Absent, not zero: zero would claim nobody searches it.
         #
@@ -3873,6 +4012,10 @@ AI_CRAWLERS = {
     "Perplexity": ["PerplexityBot", "Perplexity-User"],
     "Google": ["Google-Extended"],
     "Common Crawl": ["CCBot"],
+    # The crawler behind Yandex's generative answer. YandexAdditional is the
+    # one a site can refuse without losing ordinary Yandex indexing, which is
+    # exactly the choice a robots.txt fix has to describe.
+    "Yandex": ["YandexBot", "YandexAdditional"],
 }
 AI_CRAWLER_FLAT = [a for group in AI_CRAWLERS.values() for a in group]
 
@@ -4407,6 +4550,9 @@ CRAWLER_OPERATOR_MODELS = {
     # bingbot is what grounds the Copilot summary, so blocking it is what costs
     # visibility there — msnbot is the same crawler's older name.
     "Microsoft": ["copilot"],
+    # YandexBot is what feeds the generative answer, so blocking it is what
+    # costs visibility there.
+    "Yandex": ["yandex"],
 }
 
 MODEL_LABELS = {
@@ -4414,6 +4560,7 @@ MODEL_LABELS = {
     "deepseek": "DeepSeek", "ai_overview": "Google AI Overview",
     "copilot": "Copilot",
     "ai_mode": "Google AI Mode",
+    "yandex": "Яндекс Нейро",
 }
 
 
