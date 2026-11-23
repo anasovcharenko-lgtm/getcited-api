@@ -902,6 +902,33 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_ENABLED = (os.getenv("DEEPSEEK_ENABLED", "false").lower() == "true"
                     and bool(DEEPSEEK_API_KEY))
 
+# Claude, through the Messages API with Anthropic's own web_search tool.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Sonnet rather than the cheapest tier, on purpose. The tab will say "Claude",
+# and nobody opening the Claude app is served the cheap tier. The Gemini tab
+# already makes exactly that claim — it says "Gemini" and measures
+# gemini-3.1-flash-lite — and it is on the list to fix, so this one does not
+# get to repeat it on its first day. The saving would have been small anyway:
+# on the ChatGPT leg about 78% of the cost is the flat per-search fee rather
+# than tokens, and Anthropic charges the same $10 per 1,000 searches.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+
+# Every search is billed whether or not it changed the answer, so the model
+# does not get to decide how many to run. Three bounds one prompt at three
+# times the per-search fee, which is what makes the cost of a run predictable
+# from the prompt count — the same property the rest of the audit relies on.
+CLAUDE_MAX_SEARCHES = int(os.getenv("CLAUDE_MAX_SEARCHES", "3"))
+
+# The basic tool version. The later ones add dynamic filtering and response
+# inclusion, neither of which a measurement needs, and each newer string is a
+# newer contract that can move under us.
+CLAUDE_SEARCH_TOOL = os.getenv("CLAUDE_SEARCH_TOOL", "web_search_20250305")
+CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))
+ANTHROPIC_VERSION = "2023-06-01"
+CLAUDE_ENABLED = (os.getenv("CLAUDE_ENABLED", "false").lower() == "true"
+                  and bool(ANTHROPIC_API_KEY))
+
 # Google's AI Overviews. Google publishes no API for them, so this goes through
 # DataForSEO, which runs the search and parses the block. Two consequences worth
 # knowing before reading the numbers:
@@ -1347,6 +1374,7 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "chatgpt": lambda: True,                 # no switch: without it there is no audit
     "gemini": lambda: GEMINI_ENABLED,
     "perplexity": lambda: PERPLEXITY_ENABLED,
+    "claude": lambda: CLAUDE_ENABLED,
     "deepseek": lambda: DEEPSEEK_ENABLED,
     "ai_overview": lambda: AI_OVERVIEW_ENABLED,
     "copilot": lambda: COPILOT_ENABLED,
@@ -1389,6 +1417,10 @@ MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     # answers. A stored run should say which one it was.
     "gemini": lambda: f"{GEMINI_MODEL} via vertex" if GEMINI_VERTEX else GEMINI_MODEL,
     "perplexity": lambda: PERPLEXITY_MODEL,
+    # The search tool version belongs here too. It decides what Claude was able
+    # to do while answering, so two runs on the same model with different tool
+    # versions are not the same measurement.
+    "claude": lambda: f"{CLAUDE_MODEL} + {CLAUDE_SEARCH_TOOL}",
     "deepseek": lambda: DEEPSEEK_MODEL,
     "ai_overview": lambda: "google ai overview via dataforseo",
     # Named for the surface, not the brand: this is the summary on a Bing
@@ -1861,6 +1893,136 @@ async def ask_deepseek(prompt: str, country: str = "") -> str:
         print(f"DeepSeek error: {e}")
         MODEL_ERRORS["deepseek"] = str(e)[:300]
         return ""
+
+
+def _claude_reply(data: dict) -> tuple[str, list[str], list[str]]:
+    """The answer, the pages it cited, and the pages the search merely found.
+
+    Three lists rather than two because the API reports two different facts and
+    the difference is the one this product exists to keep. A
+    `web_search_tool_result` block is what the search engine handed back; a
+    citation on a text block is what Claude used in the sentence it wrote.
+
+    Only the citations are reported as sources. Counting retrieved pages would
+    credit a page that was fetched and ignored — the failure measured in *Cited
+    but Unused* (arXiv 2611.17161), and the same mistake we already refuse to
+    make for Yandex, where only `used` sources count. The retrieved list is
+    kept so the caller can tell "searched and cited nothing" apart from "never
+    searched", which are different answers about a brand's visibility.
+
+    Text blocks are joined without a separator: the API splits one sentence
+    across blocks at each citation boundary, so "Based on the results, " and
+    "Acme was named first" are two blocks of one sentence, and a newline
+    between them would invent a break the model did not write.
+    """
+    parts: list[str] = []
+    cited: list[str] = []
+    retrieved: list[str] = []
+    for block in (data.get("content") or []):
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            if isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            for c in (block.get("citations") or []):
+                if isinstance(c, dict) and str(c.get("url", "")).startswith("http"):
+                    cited.append(c["url"])
+        elif kind == "web_search_tool_result":
+            inner = block.get("content")
+            # A failed search arrives in this slot as an error object rather
+            # than a list of results, so the type check is load-bearing.
+            if isinstance(inner, list):
+                for r in inner:
+                    if isinstance(r, dict) and str(r.get("url", "")).startswith("http"):
+                        retrieved.append(r["url"])
+    return ("".join(parts).strip(),
+            list(dict.fromkeys(cited)),
+            list(dict.fromkeys(retrieved)))
+
+
+async def ask_claude(prompt: str, country: str = "") -> str:
+    """Claude, with Anthropic's own web_search tool.
+
+    The same shape as the ChatGPT leg: one request, the model decides whether
+    to search, and the answer comes back with citations attached to the
+    sentences they support.
+
+    An incomplete answer is reported as a failure rather than returned. The
+    turn can stop early — `pause_turn` when the model wants another request to
+    carry on searching, `max_tokens` when it runs out of room — and in both
+    cases what arrives is the first half of a sentence about a brand. Scoring
+    that would count "the answer was cut off before it got to you" as "you were
+    not named", which is the one confusion this audit is built to refuse.
+    """
+    if not CLAUDE_ENABLED:
+        MODEL_ERRORS["claude"] = "disabled"
+        return ""
+
+    tool: dict = {"type": CLAUDE_SEARCH_TOOL, "name": "web_search",
+                  "max_uses": CLAUDE_MAX_SEARCHES}
+    # Two letters or nothing. The API answers an unrecognised country code with
+    # a 400, and that would take Claude out of every prompt in the run rather
+    # than mislocalise one of them.
+    code = (country or "").strip().upper()
+    if len(code) == 2 and code.isalpha():
+        tool["user_location"] = {"type": "approximate", "country": code}
+
+    try:
+        async with httpx.AsyncClient(timeout=CLAUDE_TIMEOUT) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": ANTHROPIC_VERSION,
+                         "Content-Type": "application/json"},
+                json={"model": CLAUDE_MODEL,
+                      "max_tokens": 2048,
+                      "tools": [tool],
+                      "messages": [{"role": "user", "content": prompt}]},
+            )
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"Claude error {detail}")
+        MODEL_ERRORS["claude"] = detail
+        note_failure("claude", type(e).__name__)
+        return ""
+
+    if resp.status_code >= 400:
+        detail = f"{resp.status_code}: {resp.text[:200]}"
+        print(f"Claude error {detail}")
+        MODEL_ERRORS["claude"] = detail
+        note_failure("claude", f"HTTP {resp.status_code}")
+        return ""
+
+    data = resp.json()
+    stop = data.get("stop_reason")
+    if stop in ("pause_turn", "max_tokens"):
+        detail = f"answer incomplete (stop_reason={stop})"
+        print(f"Claude {detail}")
+        MODEL_ERRORS["claude"] = detail
+        note_failure("claude", detail)
+        return ""
+
+    text, cited, retrieved = _claude_reply(data)
+    if not text:
+        MODEL_ERRORS["claude"] = f"answered with no text: {str(data)[:200]}"
+        note_failure("claude", "answered with no text")
+        return ""
+
+    searches = (((data.get("usage") or {}).get("server_tool_use") or {})
+                .get("web_search_requests", 0))
+    if cited:
+        text += "\n\nSources: " + " ".join(cited)
+
+    # Logged, not treated as a failure. A model that answers without searching
+    # is answering from memory, which is a real fact about how it treats this
+    # brand rather than a fault — and a brand a model already knows needs
+    # different work from one it has to look up. Worth a field of its own on
+    # the answer later; for now it is in the log where it can be counted.
+    print(f"Claude OK: {len(text)} chars, {searches} search(es), "
+          f"{len(cited)} cited of {len(retrieved)} retrieved")
+    MODEL_ERRORS.pop("claude", None)
+    return text
 
 
 def keyword_eligible(prompt: str) -> bool:
@@ -2474,6 +2636,7 @@ ASK.update({
     "chatgpt": lambda prompt, country: ask_openai(prompt, use_search=True, country=country),
     "gemini": lambda prompt, country: ask_gemini(prompt, country=country),
     "perplexity": lambda prompt, country: ask_perplexity(prompt, country=country),
+    "claude": lambda prompt, country: ask_claude(prompt, country=country),
     "deepseek": lambda prompt, country: ask_deepseek(prompt, country=country),
     "ai_overview": lambda prompt, country: ask_ai_overview(prompt, country=country),
     "copilot": lambda prompt, country: ask_copilot(prompt, country=country),
@@ -4643,6 +4806,7 @@ CRAWLER_OPERATOR_MODELS = {
 
 MODEL_LABELS = {
     "chatgpt": "ChatGPT", "gemini": "Gemini", "perplexity": "Perplexity",
+    "claude": "Claude",
     "deepseek": "DeepSeek", "ai_overview": "Google AI Overview",
     "copilot": "Copilot",
     "ai_mode": "Google AI Mode",
