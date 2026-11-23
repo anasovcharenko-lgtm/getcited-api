@@ -803,6 +803,13 @@ MODEL_ERRORS: dict[str, str] = {}
 # cleared by good news.
 MODEL_FAILURES: dict[str, dict[str, int]] = {}
 
+# Models left out of this run because they do not reach the market, and the
+# reason to show instead of "not selected". Separate from MODEL_ERRORS because
+# this is not a failure: nothing broke, nothing was retried, and nothing will
+# be fixed by running it again. It is a boundary of the product, and the only
+# wrong thing to do with it is leave it unsaid.
+MODEL_OFF_MARKET: dict[str, str] = {}
+
 # The sub-questions Yandex rewrote each prompt into, keyed by prompt.
 #
 # Query fan-out, which every engine does and only this one reports back. It is
@@ -836,6 +843,13 @@ def model_error(model: str, ran: bool) -> str | None:
     rate limit the whole time.
     """
     if not ran:
+        # Checked before "not selected", because they are different facts and
+        # only one of them is the customer's doing. A market this engine does
+        # not reach is a limit of the product; a model the customer switched
+        # off is a choice they made. Reporting the first as the second invites
+        # them to look for a toggle that does not exist.
+        if model in MODEL_OFF_MARKET:
+            return MODEL_OFF_MARKET[model]
         return "not selected for this audit"
     last, tally = MODEL_ERRORS.get(model), failure_summary(model)
     if last and tally:
@@ -1001,9 +1015,19 @@ YANDEX_SEARCH_TYPES = {
 #
 # What stays hand-written is only what the vendor cannot tell us: which markets
 # to show first. The rest is whatever Google actually supports.
+# Russia was in here, and should not have been: DataForSEO stopped selling it
+# and Belarus, so the live list has neither. The fallback is only reached when
+# the vendor cannot be read — and that is exactly when offering Russia does
+# the most damage, because `dataforseo_market` would fall through to the
+# United States and the report would call the result Russia. The same mistake
+# this comment block was written about, surviving in the data below it.
+#
+# Russia and Belarus are real markets for the engines that reach them, and
+# they are listed as such in EXTRA_MARKETS, which is a claim about the product
+# rather than a claim about this vendor.
 _FALLBACK_LOCATIONS = {
     "US": "United States", "GB": "United Kingdom", "UK": "United Kingdom",
-    "RU": "Russia", "TR": "Turkey", "DE": "Germany", "FR": "France",
+    "TR": "Turkey", "DE": "Germany", "FR": "France",
     "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "PL": "Poland",
     "AE": "United Arab Emirates", "KZ": "Kazakhstan", "CA": "Canada",
     "AU": "Australia", "IN": "India", "BR": "Brazil",
@@ -1058,6 +1082,21 @@ DATAFORSEO_DEFAULT_LANGUAGE = os.getenv("DATAFORSEO_LANGUAGE", "en")
 # audits three screens down.
 MARKETS_PINNED = ["US", "GB", "DE", "FR", "ES", "IT", "NL", "PL",
                   "CA", "AU", "IN", "BR", "MX", "AE", "TR"]
+
+# Markets our SERP vendor does not sell, which other engines can still answer
+# about.
+#
+# DataForSEO dropped Russia and Belarus, and because the dropdown is built from
+# its country list, those two markets disappeared from the product entirely —
+# including for Yandex, which exists to answer exactly them, and for every
+# model that runs its own search and never touches DataForSEO. One vendor's
+# commercial decision had quietly become the boundary of what the whole product
+# could measure.
+#
+# Listed here, they come back. What they cannot do is pretend to be whole: the
+# three DataForSEO surfaces drop out of a run in these markets, by name and
+# with a reason, which is the subject of MODEL_MARKETS below.
+EXTRA_MARKETS = {"RU": "Russia", "BY": "Belarus"}
 
 # One day. The list changes when a vendor gains or drops a country — rarely,
 # but it does happen, and a cached copy from last week is the difference
@@ -1173,18 +1212,43 @@ async def load_markets(force: bool = False) -> dict[str, str]:
         return DATAFORSEO_LOCATIONS
 
 
+def market_names() -> dict[str, str]:
+    """Every market the product can be asked about, whoever answers it.
+
+    Deliberately NOT merged into DATAFORSEO_LOCATIONS, which is the lookup for
+    what to send that vendor. A Russia in there would be posted to DataForSEO
+    as a location it does not sell, and `dataforseo_market` would fall back to
+    the United States — US overviews filed under the name of the market that
+    was asked for, which is the exact failure that function exists to prevent.
+    """
+    names = dict(DATAFORSEO_LOCATIONS)
+    for code, name in EXTRA_MARKETS.items():
+        names.setdefault(code, name)
+    return names
+
+
 def markets_payload() -> dict:
-    """What the interface builds its dropdown from."""
+    """What the interface builds its dropdown from.
+
+    Each market carries the models that cannot answer it. Empty for almost all
+    of them, and the interface can say so before a run rather than leaving
+    someone to notice afterwards that three columns are missing.
+    """
+    names = market_names()
     order = {code: i for i, code in enumerate(MARKETS_PINNED)}
-    codes = [c for c in DATAFORSEO_LOCATIONS if c != "UK"]
-    codes.sort(key=lambda c: (order.get(c, len(order)), DATAFORSEO_LOCATIONS[c]))
+    codes = [c for c in names if c != "UK"]
+    codes.sort(key=lambda c: (order.get(c, len(order)), names[c]))
     return {
         "source": _markets_source,
-        "pinned": [c for c in MARKETS_PINNED if c in DATAFORSEO_LOCATIONS],
+        "pinned": [c for c in MARKETS_PINNED if c in names],
         "markets": [
             {"code": c,
-             "name": DATAFORSEO_LOCATIONS[c],
-             "language": DATAFORSEO_LANGUAGES.get(c, DATAFORSEO_DEFAULT_LANGUAGE)}
+             "name": names[c],
+             "language": DATAFORSEO_LANGUAGES.get(c, DATAFORSEO_DEFAULT_LANGUAGE),
+             # Only when there is something to say. A key present on every
+             # market and empty on 211 of them is noise the client has to
+             # filter; present only where it matters, it is a fact.
+             **({"unavailable": off} if (off := models_off_market(c)) else {})}
             for c in codes
         ],
     }
@@ -1354,9 +1418,12 @@ KEYWORD_VOLUME_PATHS = [
 #
 # Kept to the markets DATAFORSEO_LOCATIONS already offers, so the two maps
 # cannot disagree about which places exist.
+# Russia removed with the same entry in _FALLBACK_LOCATIONS and for the same
+# reason: a code here for a country the vendor does not sell is an invitation
+# to send it one.
 DATAFORSEO_LOCATION_CODES = {
     "US": 2840, "GB": 2826, "UK": 2826, "CA": 2124, "AU": 2036, "IN": 2356,
-    "RU": 2643, "KZ": 2398, "TR": 2792, "DE": 2276, "FR": 2250, "ES": 2724,
+    "KZ": 2398, "TR": 2792, "DE": 2276, "FR": 2250, "ES": 2724,
     "IT": 2380, "NL": 2528, "PL": 2616, "BR": 2076, "AE": 2784,
     # Google's geo target IDs are 2000 plus the ISO 3166-1 numeric code, which
     # is how every line above checks out and how these were derived.
@@ -1382,6 +1449,54 @@ MODEL_SWITCHES: dict[str, "callable[[], bool]"] = {
     "yandex": lambda: YANDEX_ENABLED,
 }
 ALL_MODELS = list(MODEL_SWITCHES)
+
+# Which markets each model can answer about.
+#
+# Not every engine reaches every country, and the three that go through
+# DataForSEO reach exactly the countries DataForSEO sells. Before this, the
+# product had no way to express that: a market was either in the dropdown or
+# it was not, so one vendor dropping Russia removed Russia from every model,
+# including the ones that never touch that vendor.
+#
+# A model that cannot answer a market is dropped from the run and named, with
+# the reason, in `model_status`. It is not asked and silently given nothing:
+# "we do not measure this engine here" and "this engine did not name you" are
+# opposite findings, and the second one is the one a reader assumes when a
+# column is empty.
+MODEL_MARKETS: dict[str, "callable[[str], bool]"] = {
+    "chatgpt": lambda c: True,
+    "gemini": lambda c: True,
+    "perplexity": lambda c: True,
+    "claude": lambda c: True,
+    "deepseek": lambda c: True,
+    # The vendor's own country list, not ours. `DATAFORSEO_LOCATIONS` is
+    # refreshed from DataForSEO daily, so a country it gains or drops changes
+    # this answer without anyone editing a list here — which is the point:
+    # the last hardcoded copy of this knowledge is what went stale.
+    "ai_overview": lambda c: c in DATAFORSEO_LOCATIONS,
+    "copilot": lambda c: c in DATAFORSEO_LOCATIONS,
+    "ai_mode": lambda c: c in DATAFORSEO_LOCATIONS,
+    # Yandex runs search domains for a handful of countries and answers
+    # everywhere else from yandex.com. That is a real answer about a real
+    # market rather than a substitution, so there is nothing to exclude.
+    "yandex": lambda c: True,
+}
+
+
+def serves_market(model: str, country: str) -> bool:
+    """Can this model answer about this market at all?
+
+    Unknown models are allowed through. A model missing from the table is a
+    bug in the table, and refusing to run it would turn that bug into a silent
+    zero — the assertion below is what catches it instead, at import.
+    """
+    test = MODEL_MARKETS.get(model)
+    return True if test is None else bool(test((country or "").strip().upper()))
+
+
+def models_off_market(country: str) -> list[str]:
+    """The models that cannot answer this market, in registry order."""
+    return [m for m in ALL_MODELS if not serves_market(m, country)]
 
 # Measured, but never averaged into the headline score.
 #
@@ -1442,19 +1557,32 @@ def available_models() -> list[str]:
     return [m for m, on in MODEL_SWITCHES.items() if on()]
 
 
-def selected_models(requested: list[str] | None) -> list[str]:
+def selected_models(requested: list[str] | None, country: str = "") -> list[str]:
     """What this audit will actually run.
 
     A requested model that is switched off globally stays off: the request
     narrows, it never enables. An empty intersection falls back to everything
     available, because measuring nothing and reporting 0% would read as "you are
     invisible" when the truth is "you measured nothing".
+
+    The market filter is applied last and is not subject to that fallback. If
+    nothing can answer this market, the honest answer is nothing: falling back
+    to "everything available" would run models that cannot reach the country
+    and report their silence as the brand's absence from it.
     """
     avail = available_models()
-    if not requested:
+    if requested:
+        want = {m.strip().lower() for m in requested if m and m.strip()}
+        avail = [m for m in avail if m in want] or avail
+
+    code = (country or "").strip().upper()
+    if not code:
         return avail
-    want = {m.strip().lower() for m in requested if m and m.strip()}
-    return [m for m in avail if m in want] or avail
+    keep = [m for m in avail if serves_market(m, code)]
+    for m in avail:
+        if m not in keep:
+            MODEL_OFF_MARKET[m] = f"not measured in this market ({code})"
+    return keep
 
 def _collect_gemini_urls(response) -> list[str]:
     """Grounding citations, read defensively: the shape of this metadata has moved
@@ -2647,6 +2775,12 @@ assert set(ASK) == set(ALL_MODELS), (
     f"registry and ASK disagree: {set(ALL_MODELS) ^ set(ASK)}")
 assert set(MODEL_VERSIONS) == set(ALL_MODELS), (
     f"registry and MODEL_VERSIONS disagree: {set(ALL_MODELS) ^ set(MODEL_VERSIONS)}")
+# Subset, not equality, unlike the two above. Every model must have a market
+# rule — a model without one would quietly be allowed everywhere — but a rule
+# for a model that does not exist yet is harmless, and allowing it keeps this
+# change independent of whichever model lands next.
+assert set(ALL_MODELS) <= set(MODEL_MARKETS), (
+    f"models with no market rule: {set(ALL_MODELS) - set(MODEL_MARKETS)}")
 
 
 async def enrich_brand(brand: str, description: str = "", website: str = "") -> dict:
@@ -3402,7 +3536,12 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
                           (request.brand_size or "").strip().lower(),
                           # Two audits of the same brand on different models are
                           # different audits, not a cache hit.
-                          ",".join(sorted(selected_models(request.models))),
+                          # With the market, because the market now decides
+                          # which models run: the same brand in two countries
+                          # is measured by two different sets of engines, and
+                          # a key blind to that would serve one country's run
+                          # as the other's.
+                          ",".join(sorted(selected_models(request.models, country))),
                           "|".join(sorted(p.strip() for p in request.custom_prompts)),
                           "|".join(sorted(p.strip() for p in request.extra_prompts))])
     cached = AUDIT_CACHE.get(cache_key)
@@ -3413,6 +3552,7 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     MODEL_ERRORS.clear()
     MODEL_ABSENT.clear()
     MODEL_FAILURES.clear()
+    MODEL_OFF_MARKET.clear()
     YANDEX_QUERIES.clear()
 
     brand_info = await enrich_brand(brand, description, website)
@@ -3464,8 +3604,10 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     else:
         brand_domain = ""
 
-    running = selected_models(request.models)
+    running = selected_models(request.models, country)
     print(f"  models for this run: {', '.join(running)}")
+    if MODEL_OFF_MARKET:
+        print(f"  not measured in {country}: {', '.join(sorted(MODEL_OFF_MARKET))}")
 
     async def _skip() -> str:
         """A model that was not selected returns nothing and costs nothing."""
@@ -3928,7 +4070,7 @@ async def extend_audit(request: ExtendRequest):
 
     # The same function the ordinary audit uses, so an extended audit and a
     # fresh one of the same prompts cannot report different numbers.
-    running = measured.get("models_run") or selected_models(request.models)
+    running = measured.get("models_run") or selected_models(request.models, request.country)
     competitors, competitor_domains = [], {}
     for c in request.competitor_list:
         for i, n in enumerate([x.strip() for x in c.name.split(",") if x.strip()]):
