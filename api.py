@@ -2359,12 +2359,28 @@ async def keyword_volumes(prompts: list[str], country: str = "") -> dict:
     """
     if not KEYWORD_VOLUME_ENABLED or dataforseo_locked():
         return {}
+
+    code = (country or "").upper()
+    # A market the vendor does not sell is not a market it can report volume
+    # for. Asked anyway, `dataforseo_market` falls back to the United States
+    # and the panel fills with American search volume under a Russian audit's
+    # heading — the failure that function's own warning describes, printed on
+    # every Russian run and acted on by nobody. Two billable requests per run
+    # bought it.
+    #
+    # Returning nothing is the honest answer. The panel already knows how to
+    # be empty: a prompt with no data is left out rather than stored as zero,
+    # because zero claims nobody searches it.
+    if code and code not in DATAFORSEO_LOCATIONS:
+        print(f"keyword volume: no search-volume data for {code}; "
+              f"the vendor does not sell this market, so none is reported")
+        return {}
+
     eligible = [p for p in prompts if keyword_eligible(p)]
     if not eligible:
         print("keyword volume: no prompt is short enough to look up")
         return {}
 
-    code = (country or "").upper()
     location, language = dataforseo_market(country)
     loc_code = DATAFORSEO_LOCATION_CODES.get(code)
 
@@ -4369,6 +4385,13 @@ Data: """ + summary)
         # sends. The guard below exists so the next one cannot do that quietly.
         "clusters": totals["clusters"],
         "share_of_voice": totals["share_of_voice"],
+        # Computed since Copilot was first scored apart, and dropped from the
+        # response on every run since. The warning below has been printing
+        # `dropping aggregate fields: ['separate_scores']` into the log the
+        # whole time — a number measured, scored and never shown, which is the
+        # exact fault that warning was written to catch. It caught it. Nobody
+        # was reading the log.
+        "separate_scores": totals["separate_scores"],
         "gemini_score": gemini_mentions,
         "chatgpt_score": openai_mentions,
         "total_prompts": len(prompts),
@@ -4555,7 +4578,11 @@ async def add_models_to_audit(request: AddModelsRequest):
     # question, and the rows cannot be out of date about their own contents.
     ran_before = {m for r in previous for m in ALL_MODELS if m in r}
 
-    added, skipped = [], []
+    # Three outcomes, not two. `skipped` is a model that had nothing left to
+    # answer; `unavailable` is one this market cannot be measured on at all.
+    # Folding the second into `added` is what put Copilot and AI Mode on a
+    # Russian dashboard under "didn't respond": they were never asked.
+    added, skipped, unavailable = [], [], []
     citations_new: list[dict] = []
     for m in wanted:
         # Only the prompts this model has no answer for.
@@ -4585,6 +4612,19 @@ async def add_models_to_audit(request: AddModelsRequest):
         if not isinstance(measured, dict) or "results" not in measured:
             return {"error": f"could not measure {m}", "detail": str(measured)[:300]}
 
+        # Did the sub-audit actually ask it? `selected_models` drops a model
+        # the market cannot carry, and run_audit reports that honestly — but
+        # this loop was not reading the report. It appended the model to
+        # `added` regardless, which put it into `running`, which gave it a
+        # `model_status` entry with zero answers, which the dashboard
+        # displayed as a model that did not respond. It responded to nothing,
+        # because nobody asked it anything.
+        sub_status = (measured.get("model_status") or {}).get(m) or {}
+        if sub_status.get("selected") is False:
+            unavailable.append(m)
+            print(f"  {m}: {sub_status.get('error') or 'not measured in this market'}")
+            continue
+
         # Graft the model's own block into the rows already held, matched on the
         # prompt. Only that block: everything else on the row — prompt_type,
         # search volume — was settled by the original run and must not be
@@ -4599,8 +4639,18 @@ async def add_models_to_audit(request: AddModelsRequest):
         citations_new.extend(measured.get("citations", []))
 
     if not added:
+        # Two reasons for the same empty hands, and they are not the same news
+        # to the person reading. "Already complete" means the work is done;
+        # "cannot be measured here" means it never can be, in this market, and
+        # telling them the first when it is the second sends them to press the
+        # button again.
+        if unavailable and not skipped:
+            return {"error": "those models are not measured in this market",
+                    "detail": ", ".join(unavailable),
+                    "unavailable": unavailable}
         return {"error": "those models already answered every prompt",
-                "detail": ", ".join(skipped)}
+                "detail": ", ".join(skipped + unavailable),
+                "unavailable": unavailable}
 
     running = sorted(ran_before | set(added))
     competitors, competitor_domains = [], {}
@@ -4635,7 +4685,8 @@ async def add_models_to_audit(request: AddModelsRequest):
     citations = sorted(by_page.values(), key=lambda x: x.get("total", 0), reverse=True)[:MAX_CITED_PAGES]
 
     print(f"  added models {added} over {len(previous)} prompts"
-          + (f", already complete: {skipped}" if skipped else ""))
+          + (f", already complete: {skipped}" if skipped else "")
+          + (f", not in this market: {unavailable}" if unavailable else ""))
 
     # Rebuilt here, and the reason is worth keeping.
     #
