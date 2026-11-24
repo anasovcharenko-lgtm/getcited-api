@@ -938,6 +938,18 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 # from the prompt count — the same property the rest of the audit relies on.
 CLAUDE_MAX_SEARCHES = int(os.getenv("CLAUDE_MAX_SEARCHES", "3"))
 
+# Room to finish the answer. 2048 was the first number I typed and it was
+# wrong: a Russian audit returned `3 x answer incomplete
+# (stop_reason=max_tokens)` for three prompts out of three, while ChatGPT and
+# DeepSeek answered the same questions at several times that length. An
+# analytical answer with a worked formula in it does not fit in 2048 tokens,
+# and the ceiling was being read as the model declining to speak.
+#
+# Output tokens are billed, but they are not what this leg costs: the flat
+# $10 per 1,000 searches dominates, so a generous ceiling is close to free
+# and a mean one throws away whole prompts.
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "8192"))
+
 # The basic tool version. The later ones add dynamic filtering and response
 # inclusion, neither of which a measurement needs, and each newer string is a
 # newer contract that can move under us.
@@ -2208,7 +2220,7 @@ async def ask_claude(prompt: str, country: str = "") -> str:
                          "anthropic-version": ANTHROPIC_VERSION,
                          "Content-Type": "application/json"},
                 json={"model": CLAUDE_MODEL,
-                      "max_tokens": 2048,
+                      "max_tokens": CLAUDE_MAX_TOKENS,
                       "tools": [tool],
                       "messages": [{"role": "user", "content": prompt}]},
             )
@@ -2229,7 +2241,12 @@ async def ask_claude(prompt: str, country: str = "") -> str:
     data = resp.json()
     stop = data.get("stop_reason")
     if stop in ("pause_turn", "max_tokens"):
-        detail = f"answer incomplete (stop_reason={stop})"
+        # The limit is in the message, because the first time this fired the
+        # reason on screen was "answer incomplete" and the fix was a number
+        # nobody could see from there.
+        detail = (f"answer incomplete (stop_reason={stop}"
+                  + (f", max_tokens={CLAUDE_MAX_TOKENS}" if stop == "max_tokens" else "")
+                  + ")")
         print(f"Claude {detail}")
         MODEL_ERRORS["claude"] = detail
         note_failure("claude", detail)
