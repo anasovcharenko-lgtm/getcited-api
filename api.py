@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urljoin, urlunparse
+from urllib.parse import (urlparse, parse_qs, parse_qsl, urlencode, urljoin,
+                          urlunparse, quote)
 import httpx
 load_dotenv()
 
@@ -955,6 +956,30 @@ DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
 AI_OVERVIEW_ENABLED = (os.getenv("AI_OVERVIEW_ENABLED", "false").lower() == "true"
                        and bool(DATAFORSEO_LOGIN) and bool(DATAFORSEO_PASSWORD))
 
+# A second SERP vendor, for the markets the first one does not sell.
+#
+# DataForSEO dropped Russia and Belarus, so AI Overview could not be measured
+# there at all — not because Google stops drawing the block (it draws one for
+# Cuba, Iran and mainland China excepted) but because our supplier stopped
+# selling the country. A measurement that disappears when a vendor changes its
+# commercial footprint was never measuring the market.
+#
+# Used ONLY where DataForSEO cannot answer. Every market it does sell keeps
+# going through it, byte for byte, because two vendors parsing the same block
+# are two methods, and swapping methods under an existing trend line would
+# move numbers for a reason that has nothing to do with the brand.
+BRIGHTDATA_API_KEY = os.getenv("BRIGHTDATA_API_KEY", "")
+BRIGHTDATA_ZONE = os.getenv("BRIGHTDATA_ZONE", "serp_api1")
+BRIGHTDATA_TIMEOUT = int(os.getenv("BRIGHTDATA_TIMEOUT", "90"))
+BRIGHTDATA_ENABLED = (os.getenv("BRIGHTDATA_ENABLED", "false").lower() == "true"
+                      and bool(BRIGHTDATA_API_KEY) and bool(BRIGHTDATA_ZONE))
+
+# Which vendor answered for AI Overview in this run. Read by MODEL_VERSIONS,
+# which takes no arguments and so cannot work it out for itself — and a stored
+# run has to say which pipeline produced its numbers, or a Russian audit and a
+# British one sit on one chart as though they were measured the same way.
+AI_OVERVIEW_VENDOR = "dataforseo"
+
 # The same account and the same credit pool, reading Bing instead of Google.
 #
 # Off by default, and deliberately so until a real run has been looked at. The
@@ -1473,7 +1498,10 @@ MODEL_MARKETS: dict[str, "callable[[str], bool]"] = {
     # refreshed from DataForSEO daily, so a country it gains or drops changes
     # this answer without anyone editing a list here — which is the point:
     # the last hardcoded copy of this knowledge is what went stale.
-    "ai_overview": lambda c: c in DATAFORSEO_LOCATIONS,
+    # Either vendor will do. Bright Data covers what DataForSEO does not, so
+    # with it switched on there is no market Google cannot be asked about —
+    # and with it off, the boundary is where it was.
+    "ai_overview": lambda c: c in DATAFORSEO_LOCATIONS or BRIGHTDATA_ENABLED,
     "copilot": lambda c: c in DATAFORSEO_LOCATIONS,
     "ai_mode": lambda c: c in DATAFORSEO_LOCATIONS,
     # Yandex runs search domains for a handful of countries and answers
@@ -1537,7 +1565,7 @@ MODEL_VERSIONS: dict[str, "callable[[], str]"] = {
     # versions are not the same measurement.
     "claude": lambda: f"{CLAUDE_MODEL} + {CLAUDE_SEARCH_TOOL}",
     "deepseek": lambda: DEEPSEEK_MODEL,
-    "ai_overview": lambda: "google ai overview via dataforseo",
+    "ai_overview": lambda: f"google ai overview via {AI_OVERVIEW_VENDOR}",
     # Named for the surface, not the brand: this is the summary on a Bing
     # results page, not the Copilot app, and a stored run should not let the
     # two be confused later.
@@ -2362,6 +2390,18 @@ async def ask_ai_overview(prompt: str, country: str = "") -> str:
     overview at all here; that is a fact about the query, and the audit should
     show it rather than hide it.
     """
+    global AI_OVERVIEW_VENDOR
+    # The vendor is chosen by the market, not by configuration. DataForSEO for
+    # every country it sells, which is all of them bar two, and Bright Data
+    # only where it cannot answer — so nothing about an existing market's
+    # numbers changes, and Russia stops being unmeasurable because of a
+    # supplier's commercial footprint.
+    code = (country or "").strip().upper()
+    if code and code not in DATAFORSEO_LOCATIONS:
+        AI_OVERVIEW_VENDOR = "brightdata"
+        return await _ask_brightdata_overview(prompt, code)
+
+    AI_OVERVIEW_VENDOR = "dataforseo"
     if not AI_OVERVIEW_ENABLED:
         MODEL_ERRORS["ai_overview"] = "disabled"
         return ""
@@ -2605,6 +2645,178 @@ async def _ask_serp_summary(*, model: str, label: str, engine: str,
         MODEL_ERRORS[model] = str(e)[:300]
         note_failure(model, type(e).__name__)
         return ""
+
+
+# The bold Google draws on the words that matched the query, which Bright Data
+# writes into the text as literal markers.
+#
+# They are localised, so this list is what we have seen rather than what
+# exists. Russian came first because Russia is why this vendor is here at all.
+_HIGHLIGHT_MARKERS = re.compile(
+    r"\[\s*(?:Начало|Конец)\s+выделения\s*\]"
+    r"|\[\s*(?:Start|End)\s+of\s+highlight\s*\]",
+    re.IGNORECASE)
+
+# A marker we have not seen before, recognised by shape rather than by words:
+# letters and spaces only, short, and appearing more than once in the same
+# answer. Prose does use brackets, but a bracketed phrase of nothing but
+# letters that repeats inside one AI Overview is structure, not writing.
+_MARKER_SHAPED = re.compile(r"\[[^\[\]\d]{3,40}\]")
+
+
+def _strip_highlight_markers(text: str) -> str:
+    """Remove Google's highlight markers, leaving the whitespace alone.
+
+    This matters more than it looks. Bright Data inserts the marker where the
+    bold starts, which Google puts around the words that matched the query —
+    in a brand audit, around the brand names. It lands mid-word:
+
+        'В Москве работ [Начало выделения] ает множество'
+
+    Left in, a brand could arrive as 'WARPO [Начало выделения] INT' and be
+    recorded as not mentioned in an answer that mentions it in bold. The one
+    outcome this audit must never produce.
+
+    The whitespace is deliberately NOT collapsed across the gap. Removing the
+    marker leaves 'WARPO  INT', and `brand_in_text` ignores spaces on both
+    sides, so it matches 'WARPOINT' anyway. Trying to decide which spaces were
+    real would be guesswork — 'в [маркер] Москве [маркер] есть' needs its
+    spaces kept and 'работ [маркер] ает' needs them gone, and nothing in the
+    text says which is which. Leaving them costs a doubled space in the stored
+    prose and costs the measurement nothing.
+    """
+    if not text:
+        return text
+    cleaned = _HIGHLIGHT_MARKERS.sub(" ", text)
+    # Anything marker-shaped that survived is a localisation we have not met.
+    # Stripped when it repeats, because a repeat is evidence of structure, and
+    # logged either way so the next language is a line in the log rather than
+    # a brand that silently stopped being found.
+    unknown = [m for m in set(_MARKER_SHAPED.findall(cleaned))
+               if cleaned.count(m) > 1]
+    for m in unknown:
+        print(f"Bright Data: unrecognised highlight marker {m!r}, stripping it")
+        cleaned = cleaned.replace(m, " ")
+    return cleaned
+
+
+def _parse_brightdata_overview(block: dict) -> tuple[str, list[str]]:
+    """The prose and the cited pages out of Bright Data's `ai_overview`.
+
+    Shaped nothing like DataForSEO's, so it gets its own reader rather than a
+    branch inside the other one. Checked against a real response for a Russian
+    query, not against a fixture: the last parser written from an assumed
+    shape read Google's field names off a Bing response and reported a working
+    engine as silent for a whole run.
+
+        ai_overview
+          texts[]       {type, snippet, links[{link}], image{...}}
+          references[]  {href, title, index}
+
+    Sources come from both places, deduplicated. `references` are the cards
+    Google shows beneath the answer; `links` are inside the prose. Both are
+    pages the overview pointed at, and the DataForSEO path already counts its
+    references the same way — the two markets have to mean the same thing by
+    "source" or they cannot be compared.
+
+    Images are skipped without a special case: they arrive as `data:` URIs and
+    the http check drops them.
+    """
+    parts: list[str] = []
+    urls: list[str] = []
+    for item in (block.get("texts") or []):
+        if not isinstance(item, dict):
+            continue
+        snippet = item.get("snippet")
+        if isinstance(snippet, str) and snippet.strip():
+            parts.append(_strip_highlight_markers(snippet).strip())
+        for link in (item.get("links") or []):
+            if isinstance(link, dict) and str(link.get("link", "")).startswith("http"):
+                urls.append(link["link"])
+    for ref in (block.get("references") or []):
+        if isinstance(ref, dict) and str(ref.get("href", "")).startswith("http"):
+            urls.append(ref["href"])
+    return ("\n\n".join(p for p in parts if p).strip(),
+            list(dict.fromkeys(urls)))
+
+
+async def _ask_brightdata_overview(prompt: str, country: str) -> str:
+    """Google's AI Overview through Bright Data, for a market DataForSEO lacks.
+
+    Same contract as `_ask_serp_summary`: the prose with a Sources block, or
+    an empty string with the reason recorded — in MODEL_ABSENT when Google drew
+    nothing, in MODEL_ERRORS when we could not read what it drew.
+    """
+    if not BRIGHTDATA_ENABLED:
+        MODEL_ERRORS["ai_overview"] = "no vendor for this market"
+        return ""
+
+    code = (country or "US").strip().upper()
+    lang = DATAFORSEO_LANGUAGES.get(code, DATAFORSEO_DEFAULT_LANGUAGE)
+    # `q` first: the vendor documents that parameters placed before it slow the
+    # response and lower the success rate. `brd_ai_overview=2` asks Google
+    # harder for the block and costs 5-10 seconds. One domain for every market
+    # — Google serves all results through google.com now and routes the rest,
+    # so the country lives in `gl`, never in the TLD.
+    url = ("https://www.google.com/search?q=" + quote(prompt, safe="")
+           + f"&gl={code.lower()}&hl={lang}&brd_json=1&brd_ai_overview=2")
+    try:
+        async with httpx.AsyncClient(timeout=BRIGHTDATA_TIMEOUT) as client:
+            resp = await client.post(
+                "https://api.brightdata.com/request",
+                headers={"Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"zone": BRIGHTDATA_ZONE, "url": url, "format": "raw"},
+            )
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"AI Overview (Bright Data) error {detail}")
+        MODEL_ERRORS["ai_overview"] = detail
+        note_failure("ai_overview", type(e).__name__)
+        return ""
+
+    if resp.status_code >= 400:
+        detail = f"{resp.status_code}: {resp.text[:200]}"
+        print(f"AI Overview (Bright Data) error {detail}")
+        MODEL_ERRORS["ai_overview"] = detail
+        note_failure("ai_overview", f"HTTP {resp.status_code}")
+        return ""
+
+    try:
+        data = resp.json()
+    except Exception:
+        # `brd_json=1` should make this JSON. Raw HTML here means the zone is
+        # configured for it, and parsing Google's markup ourselves is exactly
+        # what this path exists to avoid.
+        detail = "response was not JSON - is the zone's data format Full JSON?"
+        print(f"AI Overview (Bright Data): {detail}")
+        MODEL_ERRORS["ai_overview"] = detail
+        note_failure("ai_overview", "not json")
+        return ""
+
+    block = data.get("ai_overview")
+    MODEL_ERRORS.pop("ai_overview", None)
+    if not isinstance(block, dict) or not block:
+        MODEL_ABSENT.setdefault("ai_overview", set()).add(prompt)
+        print(f"AI Overview (Bright Data): Google drew no overview for {prompt[:60]!r}")
+        return ""
+
+    text, urls = _parse_brightdata_overview(block)
+    if not text:
+        # Present and unread, which is our fault and must not be filed as
+        # absence. The same distinction the DataForSEO path makes, for the
+        # same reason it had to be added there.
+        detail = ("Bright Data returned an ai_overview block but no text could "
+                  "be read from it - parser gap, not absence")
+        print(f"AI Overview (Bright Data): {detail} ({prompt[:60]!r})")
+        MODEL_ERRORS["ai_overview"] = detail
+        note_failure("ai_overview", "summary present but unread")
+        return ""
+
+    if urls:
+        text += "\n\nSources: " + " ".join(urls)
+    print(f"AI Overview (Bright Data) OK: {len(text)} chars, {len(urls)} references")
+    return text
 
 
 def _parse_ai_overview(task: dict) -> tuple[str, list[str], bool]:
