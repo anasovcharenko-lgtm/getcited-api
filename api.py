@@ -1020,6 +1020,38 @@ AI_MODE_ENABLED = (os.getenv("AI_MODE_ENABLED", "false").lower() == "true"
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "")
 YANDEX_TIMEOUT = int(os.getenv("YANDEX_TIMEOUT", "200"))
+
+# One generative request per second, which is Yandex's published quota, and
+# the same shape of failure Perplexity had: the audit fires every prompt at
+# once, one gets through, the rest come back 429. It did not look like a rate
+# limit the first time either — the first live Russian run returned two 429s
+# beside an unrelated crash, and only the failure tally kept both visible.
+#
+# Below the ceiling on purpose: the quota is per organisation, so a second
+# audit running elsewhere is spending the same second. The hourly quota is
+# 1,000 generative requests, which no audit of ours comes near.
+YANDEX_QPS = float(os.getenv("YANDEX_QPS", "0.8"))
+YANDEX_RETRIES = int(os.getenv("YANDEX_RETRIES", "4"))
+
+_yandex_pace = asyncio.Lock()
+_yandex_last = 0.0
+
+
+async def _yandex_slot() -> None:
+    """Wait until Yandex's window has room for one more request.
+
+    The same spacing `_perplexity_slot` does, and deliberately a second copy
+    rather than a shared helper: the two vendors publish different quotas and
+    will change them on their own schedules, and one knob moved for the wrong
+    vendor is a rate limit nobody can find.
+    """
+    global _yandex_last
+    async with _yandex_pace:
+        gap = 1.0 / YANDEX_QPS if YANDEX_QPS > 0 else 0.0
+        wait = _yandex_last + gap - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _yandex_last = time.monotonic()
 YANDEX_ENABLED = (os.getenv("YANDEX_ENABLED", "false").lower() == "true"
                   and bool(YANDEX_API_KEY) and bool(YANDEX_FOLDER_ID))
 
@@ -2507,6 +2539,39 @@ async def ask_ai_mode(prompt: str, country: str = "") -> str:
         extra={}, prompt=prompt, country=country)
 
 
+def _yandex_text(data: dict) -> str:
+    """The generated answer, whichever shape this response put it in.
+
+    Written as `(data.get("message") or {}).get("content")`, which crashed on
+    the first live Russian run with `'list' object has no attribute 'get'`:
+    `message` sometimes arrives as a list rather than an object. The `or {}`
+    guarded against the field being absent and did nothing about it being a
+    different type, which is the more common way a vendor's response surprises
+    you.
+
+    Worse than the crash was where it landed. The exception was caught by the
+    wrapper and filed as a model failure, so a prompt Yandex may well have
+    answered was counted as unmeasured — our own parser's blind spot wearing
+    the costume this codebase keeps having to strip off.
+
+    So: a message may be an object or a list of them, and a content may be a
+    string or a list of parts. Every shape is read, nothing is assumed, and an
+    unreadable one returns empty rather than raising — the caller already
+    knows what to do with empty, and it does not know what to do with an
+    AttributeError.
+    """
+    def content_of(message) -> str:
+        if isinstance(message, str):
+            return message
+        if isinstance(message, dict):
+            return content_of(message.get("content"))
+        if isinstance(message, list):
+            return "".join(content_of(part) for part in message)
+        return ""
+
+    return content_of(data.get("message")).strip()
+
+
 async def ask_yandex(prompt: str, country: str = "") -> str:
     """Yandex's generative answer for this prompt, from Yandex Cloud.
 
@@ -2537,21 +2602,35 @@ async def ask_yandex(prompt: str, country: str = "") -> str:
         return ""
     search_type = YANDEX_SEARCH_TYPES.get((country or "").upper(), "SEARCH_TYPE_COM")
     try:
-        async with httpx.AsyncClient(timeout=YANDEX_TIMEOUT) as client:
-            resp = await client.post(
-                "https://searchapi.api.cloud.yandex.net/v2/gen/search",
-                headers={"Authorization": f"Api-Key {YANDEX_API_KEY}",
-                         "Content-Type": "application/json"},
-                json={"messages": [{"content": prompt[:16384], "role": "ROLE_USER"}],
-                      "folderId": YANDEX_FOLDER_ID,
-                      "searchType": search_type,
-                      "fixMisspell": True},
-            )
+        for attempt in range(YANDEX_RETRIES + 1):
+            await _yandex_slot()
+            async with httpx.AsyncClient(timeout=YANDEX_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://searchapi.api.cloud.yandex.net/v2/gen/search",
+                    headers={"Authorization": f"Api-Key {YANDEX_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json={"messages": [{"content": prompt[:16384], "role": "ROLE_USER"}],
+                          "folderId": YANDEX_FOLDER_ID,
+                          "searchType": search_type,
+                          "fixMisspell": True},
+                )
+            if resp.status_code != 429:
+                break
+            # The pacing above should keep us inside the window, but the quota
+            # is organisation-wide and this process is not the only thing that
+            # can spend it. Waiting is the whole fix: a 429 is the one failure
+            # where the same request later is certain to be the right move,
+            # and dropping it loses a prompt already paid for in attention.
+            if attempt == YANDEX_RETRIES:
+                break
+            await asyncio.sleep(_retry_after(resp) or min(2 ** attempt, 8))
         if resp.status_code >= 400:
             note = f"{resp.status_code}: {resp.text[:200]}"
             print(f"Yandex {note}")
             MODEL_ERRORS["yandex"] = note
-            note_failure("yandex", f"HTTP {resp.status_code}")
+            note_failure("yandex",
+                         "rate limited (429)" if resp.status_code == 429
+                         else f"HTTP {resp.status_code}")
             return ""
         data = resp.json()
 
@@ -2564,7 +2643,7 @@ async def ask_yandex(prompt: str, country: str = "") -> str:
             print(f"Yandex declined: {prompt[:60]!r}")
             return ""
 
-        text = ((data.get("message") or {}).get("content") or "").strip()
+        text = _yandex_text(data)
         sources = [s for s in (data.get("sources") or []) if isinstance(s, dict)]
         # `used` is absent on older responses; treat a missing flag as used,
         # since dropping a real citation is the costlier mistake.
