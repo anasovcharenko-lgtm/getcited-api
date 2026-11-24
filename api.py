@@ -297,6 +297,11 @@ class AuditRequest(BaseModel):
     # its old behaviour. This narrows what runs; it never enables anything,
     # because enabling a model is a billing decision, not a per-audit one.
     models: list[str] = []
+    # How many prompts to generate. Absent means the server's default, so an
+    # older client keeps its old behaviour; whatever is asked for is capped at
+    # PROMPT_COUNT_MAX, because a request that names its own count names its
+    # own bill. Ignored when the client sends its own prompts.
+    prompt_count: int | None = None
 
 def extract_urls(text: str) -> list[str]:
     pattern = r'https?://[^\s\)\]\,\"\'<>]+'
@@ -776,8 +781,37 @@ def market_language(country: str) -> str:
 
 
 PROMPT_COUNT = int(os.getenv("PROMPT_COUNT", "20"))
-# Every prompt costs money, so hand-written lists get a ceiling too.
-MAX_CUSTOM_PROMPTS = int(os.getenv("MAX_CUSTOM_PROMPTS", "20"))
+
+# The most a request may ask for, whatever it asks for.
+#
+# The count used to be PROMPT_COUNT and nothing else: a global number, the
+# same for every account, and deaf to the request. The interface had just
+# been taught to allow fifty hand-written prompts for some accounts and
+# twenty for the rest, and generated prompts quietly ignored all of it — ask
+# for fifty, get twenty, with the download as the first place anyone found
+# out.
+#
+# A client that names its own count is a client that names its own bill, so
+# the server keeps a ceiling. It bounds typed prompts too: the interface's
+# limit is a courtesy to the person typing, not a control, and nothing
+# stopped a request carrying five hundred.
+PROMPT_COUNT_MAX = int(os.getenv("PROMPT_COUNT_MAX", "50"))
+
+
+def wanted_prompt_count(asked: int | None) -> int:
+    """How many prompts to generate: what was asked for, within reason."""
+    if not asked or asked < 1:
+        return PROMPT_COUNT
+    return min(asked, PROMPT_COUNT_MAX)
+
+
+# Every prompt costs money, so hand-written lists get a ceiling too. It
+# defaults to the same number as generated ones rather than a second literal:
+# this one was 20 while the interface was raised to 50, so fifty typed
+# prompts were accepted by the form, sent, and silently sliced back to twenty
+# — discovered in a downloaded file, which is the worst place to find out
+# that half of what you asked for was never measured.
+MAX_CUSTOM_PROMPTS = int(os.getenv("MAX_CUSTOM_PROMPTS", str(PROMPT_COUNT_MAX)))
 # Added prompts cost the same per run as generated ones, so they get a ceiling
 # of their own rather than borrowing the one above.
 MAX_EXTRA_PROMPTS = int(os.getenv("MAX_EXTRA_PROMPTS", "20"))
@@ -3513,7 +3547,8 @@ async def generate_prompts(brand: str, category: str,
                            competitors: list[str] | None = None,
                            country: str = "US",
                            language: str = "",
-                           brand_size: str = "") -> list[dict]:
+                           brand_size: str = "",
+                           count: int | None = None) -> list[dict]:
     # Competitors change the brand-type prompts, so they belong in the key.
     # Market changes both the language and the rivals, so it belongs in the key.
     language = language or market_language(country)
@@ -3523,20 +3558,24 @@ async def generate_prompts(brand: str, category: str,
     # sizes get different mixes, and without this the first one audited would
     # serve its prompts to the second from cache.
     size_key = (brand_size or DEFAULT_BRAND_SIZE).strip().lower()
+    total = wanted_prompt_count(count)
+    # The count is in the key. Without it, an audit asking for fifty would be
+    # served the twenty a previous audit of the same category generated, and
+    # the only symptom would be the number of rows.
     cache_key = "|".join([category.strip().lower(), (country or "US").upper(), language,
-                          size_key,
+                          size_key, str(total),
                           ",".join(sorted(c.lower() for c in (competitors or [])))])
     if cache_key in PROMPT_CACHE:
         print(f"Prompt cache hit: {cache_key}")
         return PROMPT_CACHE[cache_key]
 
-    counts = split_counts(PROMPT_COUNT, brand_size)
+    counts = split_counts(total, brand_size)
     response = await ask_openai(_build_generation_prompt(brand, category, counts, competitors, language))
     prompts = _parse_generated(response, counts)
 
     if len(prompts) < 2:
         print("  prompt generation produced too little, using fallback")
-        prompts = _fallback_prompts(category, PROMPT_COUNT)
+        prompts = _fallback_prompts(category, total)
 
     by_type = {}
     for p in prompts:
@@ -4001,7 +4040,14 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     clean_brand = brand_info.get("clean_brand", brand)
     language = (request.language or "").strip() or market_language(request.country)
 
-    custom = [p.strip() for p in request.custom_prompts if p.strip()][:MAX_CUSTOM_PROMPTS]
+    sent = [p.strip() for p in request.custom_prompts if p.strip()]
+    custom = sent[:MAX_CUSTOM_PROMPTS]
+    if len(sent) > len(custom):
+        # Said out loud rather than done quietly. A list silently shortened is
+        # a smaller audit wearing the size that was asked for, and the only
+        # trace used to be a row count in an export.
+        print(f"  WARNING: {len(sent)} prompts sent, measuring {len(custom)}"
+              f" (MAX_CUSTOM_PROMPTS={MAX_CUSTOM_PROMPTS})")
     extra = [p.strip() for p in request.extra_prompts if p.strip()][:MAX_EXTRA_PROMPTS]
     if custom:
         # Hand-written prompts replace generation entirely. The point of choosing
@@ -4012,7 +4058,8 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     else:
         prompt_specs = await generate_prompts(clean_brand, category, competitors,
                                               request.country, language,
-                                              request.brand_size)
+                                              request.brand_size,
+                                              request.prompt_count)
     # Added prompts sit on top of whatever the branch above produced, in both
     # modes. A tracked query is watched ALONGSIDE the rest; replacing the whole
     # set with it was the old behaviour and it silently changed what the
