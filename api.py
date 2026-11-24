@@ -913,7 +913,10 @@ PERPLEXITY_ENABLED = (os.getenv("PERPLEXITY_ENABLED", "false").lower() == "true"
 # model remembers rather than what it tells someone asking today — a different
 # quantity wearing the same label.
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+# `deepseek-flash` is the model DeepSeek's own web-tools guide tells you to use
+# with the search tool. The previous default, `deepseek-v4-flash`, was a name
+# this codebase invented from the version number.
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 DEEPSEEK_ENABLED = (os.getenv("DEEPSEEK_ENABLED", "false").lower() == "true"
                     and bool(DEEPSEEK_API_KEY))
 
@@ -2005,6 +2008,31 @@ async def ask_perplexity(prompt: str, country: str = "") -> str:
     return ""
 
 
+def _deepseek_searched(data: dict) -> bool:
+    """Did a search actually run behind this answer?
+
+    Two places say so and either will do, because the vendor documents both
+    and this code has just been caught trusting one undocumented assumption
+    too many. `usage.server_tool_use` counts the tool calls; the output array
+    carries a `web_search_call` item per call.
+
+    The question matters because `tool_choice` cannot force this tool — the
+    model decides. An answer it chose not to search for is the model's memory
+    of a brand, which is a real fact about the model and a different one from
+    what this audit measures, and the two are indistinguishable in the prose.
+    """
+    usage = (data.get("usage") or {}).get("server_tool_use")
+    if isinstance(usage, dict) and any(
+            isinstance(v, int) and v > 0 for v in usage.values()):
+        return True
+    if isinstance(usage, int) and usage > 0:
+        return True
+    for item in (data.get("output") or []):
+        if isinstance(item, dict) and item.get("type") == "web_search_call":
+            return True
+    return False
+
+
 async def ask_deepseek(prompt: str, country: str = "") -> str:
     """DeepSeek, with the search it runs on its own servers.
 
@@ -2024,7 +2052,11 @@ async def ask_deepseek(prompt: str, country: str = "") -> str:
                 headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                          "Content-Type": "application/json"},
                 json={"model": DEEPSEEK_MODEL,
-                      "tools": [{"type": "web_search"}],
+                      # `deepseek_web_search`, not `web_search`. Their name for
+                      # it, and the whole point of this call: with the wrong
+                      # type the tool is never attached, and the model answers
+                      # from memory with no sign on the response that it did.
+                      "tools": [{"type": "deepseek_web_search"}],
                       "input": prompt},
             )
         if resp.status_code >= 400:
@@ -2038,6 +2070,18 @@ async def ask_deepseek(prompt: str, country: str = "") -> str:
         text = _perplexity_text(data)
         if not text:
             MODEL_ERRORS["deepseek"] = f"answered with no text: {str(data)[:200]}"
+            return ""
+        if not _deepseek_searched(data):
+            # The docstring above promises this endpoint measures what the
+            # model tells someone asking today, not what it remembers. Nothing
+            # was checking. An answer with no search behind it is the other
+            # quantity, and it arrives looking exactly like a good one — which
+            # is how a wrong tool name survived in this function unnoticed
+            # until someone read the vendor's guide.
+            detail = "answered without searching - measuring memory, not retrieval"
+            print(f"DeepSeek {detail}")
+            MODEL_ERRORS["deepseek"] = detail
+            note_failure("deepseek", "no search performed")
             return ""
         urls = _perplexity_urls(data)
         if urls:
