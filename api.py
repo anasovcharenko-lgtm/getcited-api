@@ -2539,6 +2539,61 @@ async def ask_ai_mode(prompt: str, country: str = "") -> str:
         extra={}, prompt=prompt, country=country)
 
 
+def _yandex_merge(data) -> dict:
+    """One response object, whether the endpoint sent one or a stream of them.
+
+    `v2/gen/search` streams: the body can be a JSON array of chunks rather
+    than a single object, and then `data.get(...)` raises `'list' object has
+    no attribute 'get'` on the first field anyone reads. Which it did, three
+    prompts out of three, after the rate limiting was fixed and the prompts
+    finally got far enough to crash.
+
+    Two guesses about this endpoint's shape have now been wrong, so this one
+    assumes as little as it can and says what it saw.
+
+    Text is appended unless a chunk already contains what we have, in which
+    case it replaces it — that covers a stream of deltas and a stream of
+    cumulative snapshots without having to know which this is. Sources and
+    sub-queries are unioned in arrival order. A refusal anywhere refuses the
+    whole answer, because a stream that declined partway did decline.
+    """
+    if isinstance(data, dict):
+        return data
+    if not isinstance(data, list):
+        print(f"Yandex: response was {type(data).__name__}, not an object or a stream")
+        return {}
+
+    print(f"Yandex: response arrived as a stream of {len(data)} chunk(s)")
+    merged: dict = {"sources": [], "searchQueries": []}
+    text = ""
+    seen_sources: set = set()
+    seen_queries: set = set()
+    for chunk in data:
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("isAnswerRejected"):
+            merged["isAnswerRejected"] = True
+        # Unstripped: a delta's trailing space is the space between two words,
+        # and stripping each piece before joining produced "ВМосквеесть".
+        piece = _yandex_content(chunk.get("message"))
+        if piece:
+            # Cumulative snapshots replace; deltas append. Checking which
+            # costs one comparison and removes the need to know.
+            text = piece if text and piece.startswith(text) else text + piece
+        for s in (chunk.get("sources") or []):
+            key = s.get("url") if isinstance(s, dict) else str(s)
+            if key and key not in seen_sources:
+                seen_sources.add(key)
+                merged["sources"].append(s)
+        for q in (chunk.get("searchQueries") or []):
+            key = q.get("text") if isinstance(q, dict) else str(q)
+            if key and key not in seen_queries:
+                seen_queries.add(key)
+                merged["searchQueries"].append(q)
+    merged["message"] = {"content": text}
+    return merged
+
+
 def _yandex_text(data: dict) -> str:
     """The generated answer, whichever shape this response put it in.
 
@@ -2560,16 +2615,23 @@ def _yandex_text(data: dict) -> str:
     knows what to do with empty, and it does not know what to do with an
     AttributeError.
     """
-    def content_of(message) -> str:
-        if isinstance(message, str):
-            return message
-        if isinstance(message, dict):
-            return content_of(message.get("content"))
-        if isinstance(message, list):
-            return "".join(content_of(part) for part in message)
-        return ""
+    return _yandex_content(data.get("message")).strip()
 
-    return content_of(data.get("message")).strip()
+
+def _yandex_content(message) -> str:
+    """The text inside a message, unstripped, whatever it is wrapped in.
+
+    Separate from `_yandex_text` because the stream merge needs it without
+    the strip: a delta's trailing space is the space between two words, and
+    stripping each fragment before joining them produced "ВМосквеесть".
+    """
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        return _yandex_content(message.get("content"))
+    if isinstance(message, list):
+        return "".join(_yandex_content(part) for part in message)
+    return ""
 
 
 async def ask_yandex(prompt: str, country: str = "") -> str:
@@ -2632,7 +2694,10 @@ async def ask_yandex(prompt: str, country: str = "") -> str:
                          "rate limited (429)" if resp.status_code == 429
                          else f"HTTP {resp.status_code}")
             return ""
-        data = resp.json()
+        # Normalised before anything reads a field off it. The endpoint can
+        # answer with one object or a stream of them, and every reader below
+        # was written for the first.
+        data = _yandex_merge(resp.json())
 
         # A refusal is not an absence of an answer and not an absence of the
         # brand. Recorded as what it is, so it cannot be read as "nobody was
