@@ -3783,9 +3783,15 @@ async def run_audit(request: AuditRequest, who: Caller | None = Depends(within_q
     description = request.description
     website = request.website.strip()
 
+    # Named once, because it is now read in three places and two of them were
+    # written as though it already existed. It did not: every audit, in every
+    # market, raised NameError on the line below and returned a 500 that the
+    # interface showed as "Something went wrong."
+    country = (request.country or "US").upper()
+
     cache_key = "|".join([brand.strip().lower(),
                           ",".join(sorted(c.lower() for c in competitors)),
-                          website.lower(), (request.country or "US").upper(),
+                          website.lower(), country,
                           (request.language or ""),
                           # Size changes which prompts run, so the same brand at
                           # two sizes is two different audits.
