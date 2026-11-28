@@ -8,7 +8,7 @@ export const Route = createFileRoute("/")({
   component: Landing,
 });
 
-const BRAND = "GetCited";
+const BRAND = "Nominor";
 
 const AI_LOGOS = [
   "ChatGPT", "Claude", "Gemini", "Perplexity",
