@@ -1208,7 +1208,7 @@ EXTRA_MARKETS = {"RU": "Russia", "BY": "Belarus"}
 # but it does happen, and a cached copy from last week is the difference
 # between a market quietly failing and a market quietly lying.
 MARKETS_TTL = int(os.getenv("MARKETS_TTL", str(24 * 3600)))
-MARKETS_CACHE_FILE = os.getenv("MARKETS_CACHE_FILE", "/tmp/getcited-markets.json")
+MARKETS_CACHE_FILE = os.getenv("MARKETS_CACHE_FILE", "/tmp/nominor-markets.json")
 
 _markets_loaded_at = 0.0
 _markets_source = "fallback"
@@ -5986,7 +5986,7 @@ async def _reddit_token_get(client) -> tuple[str, str]:
             "https://www.reddit.com/api/v1/access_token",
             data={"grant_type": "client_credentials"},
             auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
-            headers={"User-Agent": "getcited/1.0 (source gap checker)"},
+            headers={"User-Agent": "nominor/1.0 (source gap checker)"},
             timeout=SOURCE_CHECK_TIMEOUT,
         )
     except Exception as exc:
@@ -6022,7 +6022,7 @@ async def _fetch_reddit(client, url: str) -> tuple[str, str, str]:
     if auth_reason:
         return "", "", auth_reason
 
-    headers = {"User-Agent": "getcited/1.0 (source gap checker)"}
+    headers = {"User-Agent": "nominor/1.0 (source gap checker)"}
     if token:
         headers["Authorization"] = f"bearer {token}"
 
@@ -6182,4 +6182,4 @@ async def health_models():
 def root():
     # Open on purpose: a health check that needs a token is not a health check.
     # Reporting whether the door is locked saves guessing after a deploy.
-    return {"status": "GetCited API is running", "auth_required": REQUIRE_AUTH}
+    return {"status": "Nominor API is running", "auth_required": REQUIRE_AUTH}
